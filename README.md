@@ -24,6 +24,7 @@ A complete automated recon tool for gathering information about web domains. It 
 • Output neatly organized into folders
 
 📦 Requirements:
+
 Termux:
 pkg update && pkg upgrade
 pkg install git python python-pip golang
