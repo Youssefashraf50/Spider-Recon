@@ -24,21 +24,4 @@ A complete automated recon tool for gathering information about web domains. It 
 • Output neatly organized into folders
 
 # 📦 Requirements:
-
-Termux:
-pkg update && pkg upgrade
-pkg install git python python-pip golang
-pip install paramspider arjun
-
-GO Tools:
-go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
-go install github.com/tomnomnom/assetfinder@latest
-go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
-go install github.com/lc/gau@latest
-go install github.com/bp0lr/gauplus@latest
-go install github.com/tomnomnom/waybackurls@latest
-go install github.com/projectdiscovery/katana/cmd/katana@latest
-go install github.com/ffuf/ffuf@latest
-go install github.com/hahwul/dalfox/v2@latest
-
 🌟Note: Automatic installation is already included inside the script.
