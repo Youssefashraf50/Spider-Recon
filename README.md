@@ -3,7 +3,7 @@
 
 A complete automated recon tool for gathering information about web domains. It checks for all required tools and installs any missing dependencies automatically.
 
-🚀 Features:
+# 🚀 Features:
 
 • Automatic dependency check and installation
 
@@ -23,7 +23,7 @@ A complete automated recon tool for gathering information about web domains. It 
 
 • Output neatly organized into folders
 
-📦 Requirements:
+# 📦 Requirements:
 
 Termux:
 pkg update && pkg upgrade
