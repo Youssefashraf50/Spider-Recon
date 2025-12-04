@@ -28,6 +28,7 @@ Termux:
 pkg update && pkg upgrade
 pkg install git python python-pip golang
 pip install paramspider arjun
+
 GO Tools:
 go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
 go install github.com/tomnomnom/assetfinder@latest
