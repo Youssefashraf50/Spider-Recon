@@ -71,6 +71,17 @@ check_tool dalfox "go install github.com/hahwul/dalfox/v2@latest"
 check_tool gf "go install github.com/tomnomnom/gf@latest"
 
 # ===========================
+# DETECT SECLISTS PATH
+# ===========================
+if [ -d "/home/kali/SecLists" ]; then
+    WORDLIST="/home/kali/SecLists/Discovery/Web-Content/common.txt"
+elif [ -d "/home/kali/seclists" ]; then
+    WORDLIST="/home/kali/seclists/Discovery/Web-Content/common.txt"
+else
+    WORDLIST="/usr/share/seclists/Discovery/Web-Content/common.txt"
+fi
+
+# ===========================
 # BANNER
 # ===========================
 cat << "EOF"
@@ -122,11 +133,21 @@ echo "[+] Crawling"
 katana -list $SUBS/live.txt -silent -o $URLS/katana.txt
 
 echo "[+] Parameters Discovery"
-paramspider -d $DOMAIN --quiet -o $URLS/paramspider
-cat $URLS/paramspider/*.txt > $URLS/params.txt
+paramspider -d $DOMAIN
+if [ -f "results/$DOMAIN.txt" ]; then
+    mv "results/$DOMAIN.txt" $URLS/params.txt
+    rm -rf results/
+else
+    touch $URLS/params.txt
+fi
 
 echo "[+] Arjun"
-arjun -i $URLS/gau.txt -oT $URLS/arjun.txt
+if [ -s "$URLS/gau.txt" ]; then
+    arjun -i $URLS/gau.txt -oT $URLS/arjun.txt
+else
+    echo "[!] gau.txt is empty, skipping Arjun."
+    touch $URLS/arjun.txt
+fi
 
 echo "[+] Merge URLs"
 cat $URLS/*.txt | sort -u > $URLS/all_urls.txt
@@ -138,11 +159,15 @@ grep -E "\.php|\.asp|\.aspx|\.jsp|\.js|\.json" $URLS/all_urls.txt > $URLS/filter
 # VULNERABILITY
 # ===========================
 echo "[+] FFUF Bruteforce"
-ffuf -u https://$DOMAIN/FUZZ \
--w /usr/share/seclists/Discovery/Web-Content/common.txt \
--mc 200,301,302,401,403 \
--t $THREADS \
--o $VULN/ffuf.json >/dev/null
+if [ -f "$WORDLIST" ]; then
+    ffuf -u https://$DOMAIN/FUZZ \
+    -w "$WORDLIST" \
+    -mc 200,301,302,401,403 \
+    -t $THREADS \
+    -o $VULN/ffuf.json >/dev/null
+else
+    echo "[!] Wordlist not found at $WORDLIST, skipping FFUF."
+fi
 
 echo "[+] XSS Scan (Dalfox)"
 dalfox file $URLS/filtered.txt -o $VULN/xss.txt
@@ -155,18 +180,17 @@ cat $URLS/all_urls.txt | gf lfi > $VULN/lfi.txt
 echo "------------------------------------------------"
 echo "[+] FINISHED"
 echo "[+] Results saved in: $OUT"
+
 # ===========================
-# | RECON REPORT SUMMARY    |
+# RECON REPORT SUMMARY
 # ===========================
 REPORT_FILE="$OUT/summary_report.txt"
-
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
-
 
 count_lines() {
     if [ -f "$1" ]; then
@@ -176,7 +200,6 @@ count_lines() {
     fi
 }
 
-
 TOTAL_SUBS=$(count_lines "$SUBS/all.txt")
 LIVE_SUBS=$(count_lines "$SUBS/live.txt")
 TOTAL_URLS=$(count_lines "$URLS/all_urls.txt")
@@ -185,7 +208,6 @@ XSS_HINTS=$(count_lines "$VULN/xss.txt")
 SQLI_HINTS=$(count_lines "$VULN/sqli.txt")
 SSRF_HINTS=$(count_lines "$VULN/ssrf.txt")
 LFI_HINTS=$(count_lines "$VULN/lfi.txt")
-
 
 {
   echo -e "${BLUE}================================================${NC}"
@@ -209,8 +231,6 @@ LFI_HINTS=$(count_lines "$VULN/lfi.txt")
   echo -e "${BLUE}================================================${NC}"
 } | tee "$REPORT_FILE"
 
-
 sed -i 's/\x1b\[[0-9;]*m//g' "$REPORT_FILE"
 
 echo -e "[+] Summary report saved to: ${GREEN}$REPORT_FILE${NC}"
-
