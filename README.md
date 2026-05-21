@@ -7,21 +7,22 @@
 
 A complete automated recon tool for gathering information about web domains. It checks for all required tools and installs any missing dependencies automatically.
 
-## 🚀 How to Use
+# 🚀 How to Use
 
 Follow these steps to get the script up and running on your system:
 
-### 1. Clone or Create the Script
+# 1. Clone or Create the Script
 Make sure the script is saved on your system (e.g., `spider-recon.sh`).
 
-### 2. Give Execution Permissions
+# 2. Give Execution Permissions
 Before running the script for the first time, you need to give it execution permissions using `chmod`:
 ```bash
 chmod +x spider-recon.sh
-## run the script
+
+# run the script
 ./spider-recon.sh -d target.com
 
-## 🚀 Features:
+# 🚀 Features:
 
 • Automatic dependency check and installation
 
@@ -41,5 +42,5 @@ chmod +x spider-recon.sh
 
 • Output neatly organized into folders
 
-## 📦 Requirements:
+# 📦 Requirements:
 🌟Note: Automatic installation is already included inside the script.
