@@ -155,3 +155,62 @@ cat $URLS/all_urls.txt | gf lfi > $VULN/lfi.txt
 echo "------------------------------------------------"
 echo "[+] FINISHED"
 echo "[+] Results saved in: $OUT"
+# ===========================
+# | RECON REPORT SUMMARY    |
+# ===========================
+REPORT_FILE="$OUT/summary_report.txt"
+
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+
+count_lines() {
+    if [ -f "$1" ]; then
+        echo $(wc -l < "$1")
+    else
+        echo "0"
+    fi
+}
+
+
+TOTAL_SUBS=$(count_lines "$SUBS/all.txt")
+LIVE_SUBS=$(count_lines "$SUBS/live.txt")
+TOTAL_URLS=$(count_lines "$URLS/all_urls.txt")
+FILTERED_URLS=$(count_lines "$URLS/filtered.txt")
+XSS_HINTS=$(count_lines "$VULN/xss.txt")
+SQLI_HINTS=$(count_lines "$VULN/sqli.txt")
+SSRF_HINTS=$(count_lines "$VULN/ssrf.txt")
+LFI_HINTS=$(count_lines "$VULN/lfi.txt")
+
+
+{
+  echo -e "${BLUE}================================================${NC}"
+  echo -e "${BLUE}          SPIDER-RECON FINAL REPORT             ${NC}"
+  echo -e "${BLUE}================================================${NC}"
+  echo -e "Target Domain: $DOMAIN"
+  echo -e "Scan Date    : $(date)"
+  echo -e "Output Folder: $OUT"
+  echo -e "------------------------------------------------"
+  echo -e "${GREEN}[+] Assets Discovery:${NC}"
+  echo -e "    - Total Subdomains Found : $TOTAL_SUBS"
+  echo -e "    - Live Subdomains (HTTPX): $LIVE_SUBS"
+  echo -e "    - Total Extracted URLs   : $TOTAL_URLS"
+  echo -e "    - Filtered URLs (.php, .js...): $FILTERED_URLS"
+  echo -e "------------------------------------------------"
+  echo -e "${YELLOW}[!] Vulnerability Candidates & Hints:${NC}"
+  echo -e "    - Potential XSS (Dalfox) : ${RED}$XSS_HINTS${NC}"
+  echo -e "    - SQLi Candidates (GF)   : $SQLI_HINTS"
+  echo -e "    - SSRF Candidates (GF)   : $SSRF_HINTS"
+  echo -e "    - LFI Candidates (GF)    : $LFI_HINTS"
+  echo -e "${BLUE}================================================${NC}"
+} | tee "$REPORT_FILE"
+
+
+sed -i 's/\x1b\[[0-9;]*m//g' "$REPORT_FILE"
+
+echo -e "[+] Summary report saved to: ${GREEN}$REPORT_FILE${NC}"
+
