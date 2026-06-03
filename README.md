@@ -40,7 +40,7 @@ chmod +x spider-recon.sh
 
 • Slow/stealth mode (-s) to avoid rate-limits and bans
 
-🌐 Asset Discovery
+### 🌐 Asset Discovery
 • Subdomain enumeration using multiple tools
   (Subfinder, Assetfinder, Amass, crt.sh)
   
@@ -50,25 +50,34 @@ chmod +x spider-recon.sh
 
 • Live host probing with tech-detection (HTTPX)
 
-🔗 URL Collection
+### 🔗 URL Collection
 • Passive URL gathering from GAU & Waybackurls
+
 • Active crawling with Katana & GoSpider
+
 • Parameter extraction using ParamSpider + Arjun
+
 • Smart filtering for important file types (php, asp, jsp, json, js)
 
-📜 JavaScript Analysis
+### 📜 JavaScript Analysis
 • JS file extraction & analysis
+
 • Secret hunting (API keys, tokens, credentials)
+
 • Hidden endpoint discovery
 
-🛡️ Vulnerability Scanning
+### 🛡️ Vulnerability Scanning
 • Full Nuclei scanning (CVEs & misconfigurations)
+
 • Lightning-fast XSS pipeline: Gxss → uro → Dalfox (10x faster)
+
 • GF pattern matching for:
   SQLi · SSRF · LFI · RCE · IDOR · Open Redirect · SSTI
+  
 • Directory & file brute-forcing with FFUF
 
-📊 Reporting
+
+### 📊 Reporting
 • Clean final summary report with all findings & scan duration
 
 # 📦 Requirements:
