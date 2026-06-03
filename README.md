@@ -20,7 +20,10 @@ Before running the script for the first time, you need to give it execution perm
 chmod +x spider-recon.sh
 
 # run the script
+fast mode
 ./spider-recon.sh -d target.com
+slow mode
+./spider-recon.sh -d example.com -s
 
 # 📌 Features:
 
