@@ -19,10 +19,12 @@ Make sure the script is saved on your system (e.g., `spider-recon.sh`).
 Before running the script for the first time, you need to give it execution permissions using `chmod`:```bash
 chmod +x spider-recon.sh
 
-# run the script
-fast mode
+# Run the Script
+
+### Fast mode
+```bash
 ./spider-recon.sh -d target.com
-slow mode
+### Slow mode
 ./spider-recon.sh -d example.com -s
 
 # 📌 Features:
