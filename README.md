@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://i.postimg.cc/VvXKkJXJ/Chat-GPT-Image-Jun-3-2026-05-30-46-PM.png" width="300">
+  <img src="https://i.postimg.cc/VvXKkJXJ/Chat-GPT-Image-Jun-3-2026-05-30-46-PM.png" width="600">
 </p>
 
 # Spider-Recon 🕷️
