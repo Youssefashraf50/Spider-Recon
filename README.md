@@ -16,9 +16,10 @@ Follow these steps to get the script up and running on your system:
 Make sure the script is saved on your system (e.g., `spider-recon.sh`).
 
 ### 2. Give Execution Permissions
-Before running the script for the first time, you need to give it execution permissions using `chmod`:```bash
+Before running the script for the first time, you need to give it execution permissions using `chmod`:
+```bash
 chmod +x spider-recon.sh
-
+```
 # Run the Script
 
 ## Fast mode
