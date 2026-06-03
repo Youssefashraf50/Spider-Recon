@@ -23,7 +23,7 @@ chmod +x spider-recon.sh
 
 ## Fast mode
 ```bash
-./spider-recon.sh -d target.com
+./spider-recon.sh -d target.com ```
 ## Slow mode
 ./spider-recon.sh -d example.com -s
 
