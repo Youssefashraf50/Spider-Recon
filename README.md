@@ -41,8 +41,11 @@ chmod +x spider-recon.sh
 🌐 Asset Discovery
 • Subdomain enumeration using multiple tools
   (Subfinder, Assetfinder, Amass, crt.sh)
+  
 • DNS resolution validation via DNSx
+
 • Port scanning with Naabu (top 1000 ports)
+
 • Live host probing with tech-detection (HTTPX)
 
 🔗 URL Collection
