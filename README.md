@@ -21,10 +21,10 @@ chmod +x spider-recon.sh
 
 # Run the Script
 
-### Fast mode
+## Fast mode
 ```bash
 ./spider-recon.sh -d target.com
-### Slow mode
+## Slow mode
 ./spider-recon.sh -d example.com -s
 
 # 📌 Features:
