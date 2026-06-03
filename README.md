@@ -35,7 +35,9 @@ chmod +x spider-recon.sh
 
 ### 🔧 Setup
 • Automatic dependency check and installation
+
 • Output neatly organized into per-target folders
+
 • Slow/stealth mode (-s) to avoid rate-limits and bans
 
 🌐 Asset Discovery
