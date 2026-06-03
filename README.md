@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="Spider Recon.png" alt="Spider Recon Logo" width="300">
+  <img src="https://ibb.co/r2dB1w2b" width="300">
 </p>
 
 # Spider-Recon 🕷️
