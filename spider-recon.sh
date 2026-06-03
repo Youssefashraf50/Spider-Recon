@@ -2,7 +2,6 @@
 # ============================================================
 #  Spider-Recon v2.1  -  Enhanced Bug Bounty Automation
 #  By: Youssef Ashraf  (enhanced edition)
-#  NOTE: استخدمه فقط على targets مصرّح لك باختبارها.
 # ============================================================
 
 set -o pipefail
