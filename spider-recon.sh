@@ -172,15 +172,43 @@ setup_dirs() {
 # ===========================
 enum_subdomains() {
   log "${BOLD}Phase 1: Subdomain Enumeration${NC}"
-  subfinder -d "$DOMAIN" -all -silent -o "$SUBS/subfinder.txt" 2>/dev/null
-  assetfinder --subs-only "$DOMAIN" 2>/dev/null > "$SUBS/assetfinder.txt"
-  amass enum -passive -d "$DOMAIN" -silent 2>/dev/null > "$SUBS/amass.txt" || true
-  curl -s "https://crt.sh/?q=%25.$DOMAIN&output=json" 2>/dev/null \
-    | grep -oE "[a-zA-Z0-9._-]+\.$DOMAIN" | sort -u > "$SUBS/crtsh.txt" || true
 
+  # Subfinder (سريع)
+  log "  → subfinder..."
+  timeout 180 subfinder -d "$DOMAIN" -all -silent -o "$SUBS/subfinder.txt" 2>/dev/null || warn "subfinder timed out"
+
+  # Assetfinder (سريع)
+  log "  → assetfinder..."
+  timeout 120 assetfinder --subs-only "$DOMAIN" 2>/dev/null > "$SUBS/assetfinder.txt" || warn "assetfinder timed out"
+
+  # crt.sh (بـ timeout عشان السيرفر بيعلّق)
+  log "  → crt.sh..."
+  timeout 60 curl -s "https://crt.sh/?q=%25.$DOMAIN&output=json" 2>/dev/null \
+    | grep -oE "[a-zA-Z0-9._-]+\.$DOMAIN" | sort -u > "$SUBS/crtsh.txt" 2>/dev/null || warn "crt.sh timed out (تخطّيناه)"
+
+  # amass — بطيء جداً، نخلّيه اختياري بـ timeout قصير أو نشيله
+  if [ "$SLOW" = false ]; then
+    log "  → amass (passive, max 5min)..."
+    timeout 300 amass enum -passive -d "$DOMAIN" -silent 2>/dev/null > "$SUBS/amass.txt" || warn "amass timed out (تخطّيناه)"
+  else
+    warn "  → amass متخطّى في الوضع السريع"
+    touch "$SUBS/amass.txt"
+  fi
+
+  # دمج النتائج
   cat "$SUBS"/*.txt 2>/dev/null | grep -E "\.?$DOMAIN$" | sort -u > "$SUBS/all.txt"
-  dnsx -l "$SUBS/all.txt" -silent -o "$SUBS/resolved.txt" 2>/dev/null || cp "$SUBS/all.txt" "$SUBS/resolved.txt"
-  ok "Total subdomains: $(count_lines "$SUBS/all.txt") | Resolved: $(count_lines "$SUBS/resolved.txt")"
+  ok "تم جمع $(count_lines "$SUBS/all.txt") subdomain"
+
+  # DNSx مع timeout
+  log "  → DNSx resolution..."
+  if [ -s "$SUBS/all.txt" ]; then
+    timeout 300 dnsx -l "$SUBS/all.txt" -silent -t "$THREADS" -o "$SUBS/resolved.txt" 2>/dev/null \
+      || cp "$SUBS/all.txt" "$SUBS/resolved.txt"
+  else
+    touch "$SUBS/resolved.txt"
+  fi
+
+  ok "Total: $(count_lines "$SUBS/all.txt") | Resolved: $(count_lines "$SUBS/resolved.txt")"
 }
 
 # ===========================
@@ -202,9 +230,21 @@ scan_ports() {
 # ===========================
 probe_hosts() {
   log "${BOLD}Phase 3: Probing Live Hosts${NC}"
-  httpx -l "$SUBS/resolved.txt" -threads "$THREADS" -rate-limit "$RATE_LIMIT" \
-    -silent -title -status-code -tech-detect -cdn -follow-redirects \
+
+  while read -r sub; do
+    echo "http://$sub"
+    echo "https://$sub"
+  done < "$SUBS/resolved.txt" > "$SUBS/resolved_with_proto.txt"
+
+  httpx -l "$SUBS/resolved_with_proto.txt" \
+    -threads "$THREADS" \
+    -rate-limit "$RATE_LIMIT" \
+    -timeout 10 \
+    -retries 2 \
+    -silent \
+    -title -status-code -tech-detect -cdn -follow-redirects \
     -o "$SUBS/live_detailed.txt" 2>/dev/null
+
   awk '{print $1}' "$SUBS/live_detailed.txt" | sort -u > "$SUBS/live.txt"
   ok "Live hosts: $(count_lines "$SUBS/live.txt")"
 }
@@ -325,7 +365,6 @@ run_xss() {
     return
   fi
 
-  # 1) dedup ذكي بالـ uro (يقلّل الآلاف لمئات)
   if command -v uro &>/dev/null; then
     cat "$SRC" | uro 2>/dev/null | sort -u > "$VULN/xss_dedup.txt"
   else
@@ -333,10 +372,8 @@ run_xss() {
   fi
   ok "بعد uro dedup: $(count_lines "$VULN/xss_dedup.txt") URLs"
 
-  # 2) فلترة الـ URLs اللي فيها reflection فعلاً (Gxss) = أسرع بكتير
   if command -v Gxss &>/dev/null; then
     cat "$VULN/xss_dedup.txt" | Gxss -c 50 2>/dev/null | sort -u > "$VULN/xss_reflected.txt"
-    # لو Gxss طلّع نتائج نستخدمها، غير كده نرجع للـ dedup
     if [ -s "$VULN/xss_reflected.txt" ]; then
       cp "$VULN/xss_reflected.txt" "$VULN/xss_targets.txt"
     else
@@ -347,7 +384,7 @@ run_xss() {
   fi
   ok "Targets نهائية للـ dalfox: $(count_lines "$VULN/xss_targets.txt") URLs"
 
-  # 3) dalfox بإعدادات سريعة
+  # 3) dalfox 
   dalfox file "$VULN/xss_targets.txt" \
     --worker 100 \
     --timeout 5 \
