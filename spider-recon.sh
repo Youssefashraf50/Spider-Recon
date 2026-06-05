@@ -173,20 +173,16 @@ setup_dirs() {
 enum_subdomains() {
   log "${BOLD}Phase 1: Subdomain Enumeration${NC}"
 
-  # Subfinder (سريع)
   log "  → subfinder..."
   timeout 180 subfinder -d "$DOMAIN" -all -silent -o "$SUBS/subfinder.txt" 2>/dev/null || warn "subfinder timed out"
 
-  # Assetfinder (سريع)
   log "  → assetfinder..."
   timeout 120 assetfinder --subs-only "$DOMAIN" 2>/dev/null > "$SUBS/assetfinder.txt" || warn "assetfinder timed out"
 
-  # crt.sh (بـ timeout عشان السيرفر بيعلّق)
   log "  → crt.sh..."
   timeout 60 curl -s "https://crt.sh/?q=%25.$DOMAIN&output=json" 2>/dev/null \
     | grep -oE "[a-zA-Z0-9._-]+\.$DOMAIN" | sort -u > "$SUBS/crtsh.txt" 2>/dev/null || warn "crt.sh timed out (تخطّيناه)"
 
-  # amass — بطيء جداً، نخلّيه اختياري بـ timeout قصير أو نشيله
   if [ "$SLOW" = false ]; then
     log "  → amass (passive, max 5min)..."
     timeout 300 amass enum -passive -d "$DOMAIN" -silent 2>/dev/null > "$SUBS/amass.txt" || warn "amass timed out (تخطّيناه)"
@@ -195,11 +191,9 @@ enum_subdomains() {
     touch "$SUBS/amass.txt"
   fi
 
-  # دمج النتائج
   cat "$SUBS"/*.txt 2>/dev/null | grep -E "\.?$DOMAIN$" | sort -u > "$SUBS/all.txt"
   ok "تم جمع $(count_lines "$SUBS/all.txt") subdomain"
 
-  # DNSx مع timeout
   log "  → DNSx resolution..."
   if [ -s "$SUBS/all.txt" ]; then
     timeout 300 dnsx -l "$SUBS/all.txt" -silent -t "$THREADS" -o "$SUBS/resolved.txt" 2>/dev/null \
@@ -332,20 +326,48 @@ run_nuclei() {
 
 # ===========================
 #  PHASE 11: FFUF CONTENT DISCOVERY
+#  [PATCHED] timeout per host + max 5 hosts + maxtime-job
 # ===========================
 run_ffuf() {
   log "${BOLD}Phase 11: Content Discovery (ffuf)${NC}"
-  if [ -f "$WORDLIST" ]; then
-    head -n 15 "$SUBS/live.txt" | while read -r host; do
-      safe=$(echo "$host" | sed 's|https\?://||; s|/|_|g')
-      ffuf -u "${host}/FUZZ" -w "$WORDLIST" -mc 200,204,301,302,307,401,403,405 \
-        -t "$THREADS" -rate "$RATE_LIMIT" -ac -of json \
-        -o "$VULN/ffuf_${safe}.json" 2>/dev/null
-    done
-    ok "FFUF results saved to $VULN/ffuf_*.json"
-  else
+  if [ ! -f "$WORDLIST" ]; then
     warn "Wordlist not found at $WORDLIST, skipping FFUF."
+    return
   fi
+
+  # في الـ slow mode نشتغل على 3 hosts بس وrate أقل
+  local MAX_HOSTS=5
+  local FFUF_THREADS=50
+  local FFUF_RATE=$RATE_LIMIT
+  local JOB_TIMEOUT=90
+  local HOST_TIMEOUT=120
+
+  if $SLOW; then
+    MAX_HOSTS=3
+    FFUF_THREADS=20
+    FFUF_RATE=30
+    JOB_TIMEOUT=60
+    HOST_TIMEOUT=80
+  fi
+
+  head -n "$MAX_HOSTS" "$SUBS/live.txt" | while read -r host; do
+    safe=$(echo "$host" | sed 's|https\?://||; s|/|_|g')
+    log "  → ffuf: $host"
+    timeout "$HOST_TIMEOUT" ffuf \
+      -u "${host}/FUZZ" \
+      -w "$WORDLIST" \
+      -mc 200,204,301,302,307,401,403,405 \
+      -t "$FFUF_THREADS" \
+      -rate "$FFUF_RATE" \
+      -maxtime-job "$JOB_TIMEOUT" \
+      -ac \
+      -p 0.1 \
+      -of json \
+      -o "$VULN/ffuf_${safe}.json" \
+      2>/dev/null || warn "  → ffuf timeout/skip: $host"
+  done
+
+  ok "FFUF results saved to $VULN/ffuf_*.json"
 }
 
 # ===========================
@@ -355,7 +377,6 @@ run_ffuf() {
 run_xss() {
   log "${BOLD}Phase 12: XSS Scanning (Optimized: Gxss -> uro -> dalfox)${NC}"
 
-  # المصدر: نتائج gf xss أو الـ parameterized urls
   local SRC="$VULN/gf_xss.txt"
   [ -s "$SRC" ] || SRC="$URLS/params_urls.txt"
 
@@ -384,7 +405,6 @@ run_xss() {
   fi
   ok "Targets نهائية للـ dalfox: $(count_lines "$VULN/xss_targets.txt") URLs"
 
-  # 3) dalfox 
   dalfox file "$VULN/xss_targets.txt" \
     --worker 100 \
     --timeout 5 \
@@ -433,6 +453,17 @@ report() {
     echo "  - IDOR (gf)            : $(count_lines "$VULN/gf_idor.txt")"
     echo "  - Open Redirect (gf)   : $(count_lines "$VULN/gf_redirect.txt")"
     echo "  - SSTI (gf)            : $(count_lines "$VULN/gf_ssti.txt")"
+    echo "================================================"
+    echo ""
+    echo "[>] NEXT STEPS — افحص بالترتيب ده:"
+    [ "$(count_lines "$VULN/nuclei.txt")" -gt 0 ]      && echo "  1. cat $VULN/nuclei.txt | grep -iE 'critical|high'"
+    [ "$(count_lines "$VULN/xss.txt")" -gt 0 ]         && echo "  2. cat $VULN/xss.txt"
+    [ "$(count_lines "$JS/secrets.txt")" -gt 0 ]       && echo "  3. cat $JS/secrets.txt"
+    [ "$(count_lines "$VULN/gf_sqli.txt")" -gt 0 ]     && echo "  4. cat $VULN/gf_sqli.txt | head -20  # test manually"
+    [ "$(count_lines "$VULN/gf_ssrf.txt")" -gt 0 ]     && echo "  5. cat $VULN/gf_ssrf.txt"
+    [ "$(count_lines "$VULN/gf_idor.txt")" -gt 0 ]     && echo "  6. cat $VULN/gf_idor.txt"
+    [ "$(count_lines "$VULN/gf_lfi.txt")" -gt 0 ]      && echo "  7. cat $VULN/gf_lfi.txt"
+    [ "$(count_lines "$VULN/gf_redirect.txt")" -gt 0 ] && echo "  8. cat $VULN/gf_redirect.txt"
     echo "================================================"
   } | tee "$REPORT_FILE"
   ok "Report saved to: $REPORT_FILE"
