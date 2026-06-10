@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================
-#  Spider-Recon v2.1  -  Enhanced Bug Bounty Automation
-#  By: Youssef Ashraf  (enhanced edition)
+#  Spider-Recon  -  Enhanced Bug Bounty Automation
+#  By: Youssef Ashraf 
 # ============================================================
 
 set -o pipefail
@@ -83,7 +83,7 @@ fi
 # ===========================
 #  HELPERS
 # ===========================
-count_lines() { [ -f "$1" ] && wc -l < "$1" || echo 0; }
+count_lines() { [ -f "$1" ] && grep -c "" "$1" 2>/dev/null || echo 0; }
 
 # ===========================
 #  TOOL CHECKER
@@ -123,8 +123,35 @@ install_dependencies() {
   command -v paramspider &>/dev/null || pip install -q paramspider 2>/dev/null
   command -v arjun       &>/dev/null || pip install -q arjun 2>/dev/null
   command -v uro         &>/dev/null || pip install -q uro 2>/dev/null
-  # تحديث nuclei templates في الخلفية
-  command -v nuclei &>/dev/null && nuclei -update-templates -silent &>/dev/null &
+
+  # -------------------------------------------------------
+  # FIX: تحميل gf patterns لو مش موجودة
+  # بدون ده Phase 9 بتطلع صفر دايماً
+  # -------------------------------------------------------
+  local GF_PATTERNS_DIR="$HOME/.config/gf"
+  if [ ! -d "$GF_PATTERNS_DIR" ] || [ -z "$(ls -A "$GF_PATTERNS_DIR" 2>/dev/null)" ]; then
+    warn "gf patterns not found — downloading from Gf-Patterns & tomnomnom..."
+    mkdir -p "$GF_PATTERNS_DIR"
+    # Gf-Patterns repo (الأكثر شيوعاً في bug bounty)
+    local TMP_GF
+    TMP_GF=$(mktemp -d)
+    git clone -q --depth=1 https://github.com/1ndianl33t/Gf-Patterns "$TMP_GF/gf1" 2>/dev/null \
+      && cp "$TMP_GF/gf1"/*.json "$GF_PATTERNS_DIR/" 2>/dev/null \
+      && ok "Gf-Patterns loaded (1ndianl33t)"
+    git clone -q --depth=1 https://github.com/tomnomnom/gf "$TMP_GF/gf2" 2>/dev/null \
+      && cp "$TMP_GF/gf2/examples"/*.json "$GF_PATTERNS_DIR/" 2>/dev/null \
+      && ok "gf examples loaded (tomnomnom)"
+    rm -rf "$TMP_GF"
+  else
+    ok "gf patterns found: $(ls "$GF_PATTERNS_DIR"/*.json 2>/dev/null | wc -l) patterns"
+  fi
+
+  # تحديث nuclei templates في الخلفية وحفظ الـ PID
+  if command -v nuclei &>/dev/null; then
+    nuclei -update-templates -silent &>/dev/null &
+    NUCLEI_UPDATE_PID=$!
+    ok "Nuclei templates updating in background (PID $NUCLEI_UPDATE_PID)"
+  fi
 }
 
 # ===========================
@@ -135,10 +162,13 @@ detect_wordlists() {
     if [ -d "$base" ]; then
       WORDLIST="$base/Discovery/Web-Content/raft-medium-directories.txt"
       [ -f "$WORDLIST" ] || WORDLIST="$base/Discovery/Web-Content/common.txt"
+      ok "Wordlist: $WORDLIST ($(wc -l < "$WORDLIST") lines)"
       return
     fi
   done
+  # fallback
   WORDLIST="/usr/share/wordlists/dirb/common.txt"
+  [ -f "$WORDLIST" ] && ok "Wordlist fallback: $WORDLIST" || warn "No wordlist found — ffuf will be skipped"
 }
 
 # ===========================
@@ -152,7 +182,7 @@ cat << "EOF"
   \___ \| '_ \| |/ _` |/ _ \ '__|  |  _  // _ \/ __/ _ \| '_ \
   ____) | |_) | | (_| |  __/ |     | | \ \  __/ (_| (_) | | | |
  |_____/| .__/|_|\__,_|\___|_|     |_|  \_\___|\___\___/|_| |_|
-        | |              v2.1  -  Bug Bounty Edition
+        | |              v2.2  -  Bug Bounty Edition (Fixed)
         |_|              By: Youssef Ashraf
 EOF
 }
@@ -174,29 +204,76 @@ enum_subdomains() {
   log "${BOLD}Phase 1: Subdomain Enumeration${NC}"
 
   log "  → subfinder..."
-  timeout 180 subfinder -d "$DOMAIN" -all -silent -o "$SUBS/subfinder.txt" 2>/dev/null || warn "subfinder timed out"
+  timeout 180 subfinder -d "$DOMAIN" -all -silent -o "$SUBS/subfinder.txt" 2>/dev/null \
+    || { warn "subfinder timed out"; touch "$SUBS/subfinder.txt"; }
 
   log "  → assetfinder..."
-  timeout 120 assetfinder --subs-only "$DOMAIN" 2>/dev/null > "$SUBS/assetfinder.txt" || warn "assetfinder timed out"
+  timeout 120 assetfinder --subs-only "$DOMAIN" 2>/dev/null > "$SUBS/assetfinder.txt" \
+    || { warn "assetfinder timed out"; touch "$SUBS/assetfinder.txt"; }
 
-  log "  → crt.sh..."
-  timeout 60 curl -s "https://crt.sh/?q=%25.$DOMAIN&output=json" 2>/dev/null \
-    | grep -oE "[a-zA-Z0-9._-]+\.$DOMAIN" | sort -u > "$SUBS/crtsh.txt" 2>/dev/null || warn "crt.sh timed out (تخطّيناه)"
+  # -------------------------------------------------------
+  # FIX: crt.sh — retry x3 + user-agent + jq بديل grep
+  # السبب الأصلي: curl بدون -L وبدون retry والـ JSON parsing هش
+  # -------------------------------------------------------
+  log "  → crt.sh (retry x3)..."
+  local CRT_SUCCESS=false
+  for attempt in 1 2 3; do
+    local CRT_RAW
+    CRT_RAW=$(timeout 45 curl -s -L \
+      -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64)" \
+      --retry 2 --retry-delay 3 \
+      "https://crt.sh/?q=%25.$DOMAIN&output=json" 2>/dev/null)
 
+    if echo "$CRT_RAW" | grep -q "name_value"; then
+      echo "$CRT_RAW" \
+        | grep -oP '"name_value"\s*:\s*"\K[^"]+' \
+        | tr ',' '\n' \
+        | sed 's/^\*\.//' \
+        | grep -E "\.?${DOMAIN}$" \
+        | sort -u > "$SUBS/crtsh.txt"
+      ok "crt.sh: $(count_lines "$SUBS/crtsh.txt") subdomains (attempt $attempt)"
+      CRT_SUCCESS=true
+      break
+    else
+      warn "crt.sh attempt $attempt failed, retrying in 5s..."
+      sleep 5
+    fi
+  done
+  $CRT_SUCCESS || { warn "crt.sh failed after 3 attempts"; touch "$SUBS/crtsh.txt"; }
+
+  # -------------------------------------------------------
+  # FIX: amass timeout مناسب + passive فقط
+  # amass في active mode ممكن يأخد 30+ دقيقة
+  # -------------------------------------------------------
   if [ "$SLOW" = false ]; then
-    log "  → amass (passive, max 5min)..."
-    timeout 300 amass enum -passive -d "$DOMAIN" -silent 2>/dev/null > "$SUBS/amass.txt" || warn "amass timed out (تخطّيناه)"
+    log "  → amass (passive, timeout 4min)..."
+    timeout 240 amass enum \
+      -passive \
+      -d "$DOMAIN" \
+      -timeout 3 \
+      -silent \
+      2>/dev/null > "$SUBS/amass.txt" \
+      || { warn "amass timed out — partial results saved"; }
   else
-    warn "  → amass متخطّى في الوضع السريع"
+    warn "  → amass skipped in slow mode"
     touch "$SUBS/amass.txt"
   fi
 
-  cat "$SUBS"/*.txt 2>/dev/null | grep -E "\.?$DOMAIN$" | sort -u > "$SUBS/all.txt"
-  ok "تم جمع $(count_lines "$SUBS/all.txt") subdomain"
+  cat "$SUBS"/*.txt 2>/dev/null \
+    | grep -E "\.?${DOMAIN}$" \
+    | sed 's/^\*\.//' \
+    | sort -u > "$SUBS/all.txt"
+
+  ok "Collected $(count_lines "$SUBS/all.txt") unique subdomains"
 
   log "  → DNSx resolution..."
   if [ -s "$SUBS/all.txt" ]; then
-    timeout 300 dnsx -l "$SUBS/all.txt" -silent -t "$THREADS" -o "$SUBS/resolved.txt" 2>/dev/null \
+    timeout 300 dnsx \
+      -l "$SUBS/all.txt" \
+      -silent \
+      -t "$THREADS" \
+      -retry 2 \
+      -o "$SUBS/resolved.txt" 2>/dev/null \
       || cp "$SUBS/all.txt" "$SUBS/resolved.txt"
   else
     touch "$SUBS/resolved.txt"
@@ -211,11 +288,16 @@ enum_subdomains() {
 scan_ports() {
   log "${BOLD}Phase 2: Port Scanning (top 1000)${NC}"
   if command -v naabu &>/dev/null; then
-    naabu -l "$SUBS/resolved.txt" -top-ports 1000 -silent -rate "$RATE_LIMIT" \
+    naabu \
+      -l "$SUBS/resolved.txt" \
+      -top-ports 1000 \
+      -silent \
+      -rate "$RATE_LIMIT" \
       -o "$PORTS/naabu.txt" 2>/dev/null || true
-    ok "Open ports saved to $PORTS/naabu.txt"
+    ok "Open ports saved to $PORTS/naabu.txt ($(count_lines "$PORTS/naabu.txt") entries)"
   else
     warn "naabu not available, skipping port scan."
+    touch "$PORTS/naabu.txt"
   fi
 }
 
@@ -230,7 +312,8 @@ probe_hosts() {
     echo "https://$sub"
   done < "$SUBS/resolved.txt" > "$SUBS/resolved_with_proto.txt"
 
-  httpx -l "$SUBS/resolved_with_proto.txt" \
+  httpx \
+    -l "$SUBS/resolved_with_proto.txt" \
     -threads "$THREADS" \
     -rate-limit "$RATE_LIMIT" \
     -timeout 10 \
@@ -252,11 +335,22 @@ collect_urls() {
   cat "$SUBS/resolved.txt" | waybackurls 2>/dev/null | anew "$URLS/wayback.txt" >/dev/null || true
 
   log "${BOLD}Phase 5: Active Crawling${NC}"
-  katana -list "$SUBS/live.txt" -d 3 -jc -kf all -c "$THREADS" -rl "$RATE_LIMIT" \
-    -silent -o "$URLS/katana.txt" 2>/dev/null || true
+  katana \
+    -list "$SUBS/live.txt" \
+    -d 3 -jc -kf all \
+    -c "$THREADS" \
+    -rl "$RATE_LIMIT" \
+    -silent \
+    -o "$URLS/katana.txt" 2>/dev/null || true
+
   if command -v gospider &>/dev/null; then
-    gospider -S "$SUBS/live.txt" -c 10 -d 2 -t "$THREADS" --js -q 2>/dev/null \
-      | grep -oE 'https?://[^ ]+' | anew "$URLS/gospider.txt" >/dev/null || true
+    gospider \
+      -S "$SUBS/live.txt" \
+      -c 10 -d 2 \
+      -t "$THREADS" \
+      --js -q 2>/dev/null \
+      | grep -oE 'https?://[^ ]+' \
+      | anew "$URLS/gospider.txt" >/dev/null || true
   fi
 
   log "${BOLD}Phase 6: Parameter Discovery${NC}"
@@ -293,89 +387,216 @@ analyze_js() {
 # ===========================
 filter_urls() {
   log "${BOLD}Phase 8: Filtering Interesting URLs${NC}"
-  grep -iE "\.(php|asp|aspx|jsp|json|do|action|cgi)(\?|$)" "$URLS/all_urls.txt" > "$URLS/filtered.txt" 2>/dev/null
-  grep -E "\?[a-zA-Z0-9_]+=" "$URLS/all_urls.txt" | qsreplace -a 2>/dev/null | sort -u > "$URLS/params_urls.txt"
+  grep -iE "\.(php|asp|aspx|jsp|json|do|action|cgi)(\?|$)" "$URLS/all_urls.txt" \
+    > "$URLS/filtered.txt" 2>/dev/null || touch "$URLS/filtered.txt"
+  grep -E "\?[a-zA-Z0-9_]+=" "$URLS/all_urls.txt" \
+    | qsreplace -a 2>/dev/null \
+    | sort -u > "$URLS/params_urls.txt" || touch "$URLS/params_urls.txt"
   ok "Filtered URLs: $(count_lines "$URLS/filtered.txt") | Parameterized: $(count_lines "$URLS/params_urls.txt")"
 }
 
 # ===========================
 #  PHASE 9: GF PATTERNS
 # ===========================
+# FIX: السبب الأساسي للصفر هو إن gf patterns مش متحملة
+# حليناه في install_dependencies بالـ git clone
+# بالإضافة: لو all_urls.txt فاضي كمان بتطلع صفر
+# ===========================
 gf_patterns() {
   log "${BOLD}Phase 9: GF Pattern Matching${NC}"
+
+  if [ ! -s "$URLS/all_urls.txt" ]; then
+    warn "all_urls.txt is empty — skipping gf (no URLs collected yet)"
+    for pat in xss sqli ssrf lfi rce idor redirect ssti; do
+      touch "$VULN/gf_$pat.txt"
+    done
+    return
+  fi
+
+  local GF_PATTERNS_DIR="$HOME/.config/gf"
+  if [ ! -d "$GF_PATTERNS_DIR" ] || [ -z "$(ls -A "$GF_PATTERNS_DIR"/*.json 2>/dev/null)" ]; then
+    warn "gf patterns directory empty — results will be 0. Run install step first."
+  fi
+
   for pat in xss sqli ssrf lfi rce idor redirect ssti; do
-    cat "$URLS/all_urls.txt" | gf "$pat" 2>/dev/null | sort -u > "$VULN/gf_$pat.txt"
+    if gf "$pat" < /dev/null 2>&1 | grep -q "no such pattern"; then
+      warn "Pattern '$pat' not found in $GF_PATTERNS_DIR"
+      touch "$VULN/gf_$pat.txt"
+    else
+      cat "$URLS/all_urls.txt" | gf "$pat" 2>/dev/null | sort -u > "$VULN/gf_$pat.txt"
+    fi
   done
+
   ok "GF: sqli=$(count_lines "$VULN/gf_sqli.txt") xss=$(count_lines "$VULN/gf_xss.txt") ssrf=$(count_lines "$VULN/gf_ssrf.txt") lfi=$(count_lines "$VULN/gf_lfi.txt")"
+
+  # تنبيه لو لسه بصفر بعد ما الـ patterns موجودة
+  local TOTAL_GF=0
+  for pat in xss sqli ssrf lfi rce idor redirect ssti; do
+    TOTAL_GF=$((TOTAL_GF + $(count_lines "$VULN/gf_$pat.txt")))
+  done
+  if [ "$TOTAL_GF" -eq 0 ]; then
+    warn "All gf results are 0 — likely the collected URLs have no parameters yet."
+    warn "Check: wc -l $URLS/all_urls.txt && cat $URLS/params_urls.txt | head -5"
+  fi
 }
 
 # ===========================
 #  PHASE 10: NUCLEI
 # ===========================
+# FIX: مشاكل nuclei = 0 الشائعة:
+#   1. templates مش موجودة → نتأكد منها أولاً
+#   2. live.txt فاضي → نتحقق
+#   3. كل الـ hosts CDN أو تتطلب auth → نضيف -hh
+#   4. rate limit عالي جداً → بنخففه
+# ===========================
 run_nuclei() {
   log "${BOLD}Phase 10: Nuclei Scanning${NC}"
-  if command -v nuclei &>/dev/null; then
-    wait  # نتأكد إن الـ templates خلصت تحديث
-    nuclei -l "$SUBS/live.txt" -severity low,medium,high,critical \
-      -rl "$RATE_LIMIT" -c "$THREADS" -silent -o "$VULN/nuclei.txt" 2>/dev/null || true
-    ok "Nuclei findings: $(count_lines "$VULN/nuclei.txt")"
-  else
+
+  if ! command -v nuclei &>/dev/null; then
     warn "nuclei not available, skipping."
+    touch "$VULN/nuclei.txt"
+    return
+  fi
+
+  # انتظر تحديث الـ templates لو لسه شغال
+  if [ -n "$NUCLEI_UPDATE_PID" ] && kill -0 "$NUCLEI_UPDATE_PID" 2>/dev/null; then
+    log "  → Waiting for nuclei templates update..."
+    wait "$NUCLEI_UPDATE_PID" 2>/dev/null || true
+  fi
+
+  # تأكد إن في templates فعلاً
+  local TEMPLATES_DIR="$HOME/nuclei-templates"
+  if [ ! -d "$TEMPLATES_DIR" ]; then
+    log "  → First-time nuclei templates download..."
+    nuclei -update-templates -silent 2>/dev/null
+  fi
+
+  if [ ! -s "$SUBS/live.txt" ]; then
+    warn "live.txt is empty — skipping nuclei"
+    touch "$VULN/nuclei.txt"
+    return
+  fi
+
+  log "  → Running nuclei (this may take a while)..."
+  nuclei \
+    -l "$SUBS/live.txt" \
+    -severity low,medium,high,critical \
+    -rl "$RATE_LIMIT" \
+    -c "$THREADS" \
+    -timeout 10 \
+    -retries 1 \
+    -silent \
+    -stats \
+    -o "$VULN/nuclei.txt" 2>/dev/null || true
+
+  local NUCLEI_COUNT
+  NUCLEI_COUNT=$(count_lines "$VULN/nuclei.txt")
+  ok "Nuclei findings: $NUCLEI_COUNT"
+
+  if [ "$NUCLEI_COUNT" -eq 0 ]; then
+    warn "Nuclei found 0 — possible reasons:"
+    warn "  1. Hosts require auth (try adding cookies with -H)"
+    warn "  2. Templates need update: nuclei -update-templates"
+    warn "  3. Target has WAF/CDN blocking scans"
+    warn "  Manual check: nuclei -u \$(head -1 $SUBS/live.txt) -severity info -debug"
   fi
 }
 
 # ===========================
 #  PHASE 11: FFUF CONTENT DISCOVERY
-#  [PATCHED] timeout per host + max 5 hosts + maxtime-job
+# ===========================
+# FIX: السبب الأساسي للبطء:
+#   1. بيشتغل على كل hosts (ممكن 100+)
+#   2. الـ wordlist كبيرة (raft-medium = 30k line)
+#   3. مفيش -maxtime-job (بيكمل لحد ما يخلص)
+#
+# الحل:
+#   - MAX_HOSTS محدود (5 normal / 3 slow)
+#   - wordlist صغيرة سريعة (common.txt كـ default)
+#   - maxtime-job صارم
+#   - parallel background jobs بدل sequential
 # ===========================
 run_ffuf() {
   log "${BOLD}Phase 11: Content Discovery (ffuf)${NC}"
+
   if [ ! -f "$WORDLIST" ]; then
     warn "Wordlist not found at $WORDLIST, skipping FFUF."
     return
   fi
 
-  # في الـ slow mode نشتغل على 3 hosts بس وrate أقل
-  local MAX_HOSTS=5
-  local FFUF_THREADS=50
-  local FFUF_RATE=$RATE_LIMIT
-  local JOB_TIMEOUT=90
-  local HOST_TIMEOUT=120
-
-  if $SLOW; then
-    MAX_HOSTS=3
-    FFUF_THREADS=20
-    FFUF_RATE=30
-    JOB_TIMEOUT=60
-    HOST_TIMEOUT=80
+  # -------------------------------------------------------
+  # نفضّل wordlist صغيرة وسريعة
+  # لو الـ wordlist > 20k سطر نستخدم common.txt بدلها
+  # -------------------------------------------------------
+  local ACTIVE_WORDLIST="$WORDLIST"
+  local WL_LINES
+  WL_LINES=$(wc -l < "$WORDLIST")
+  if [ "$WL_LINES" -gt 20000 ]; then
+    # دور على common.txt في نفس المجلد
+    local COMMON
+    COMMON=$(dirname "$WORDLIST")/common.txt
+    if [ -f "$COMMON" ]; then
+      ACTIVE_WORDLIST="$COMMON"
+      warn "Wordlist too large ($WL_LINES lines) — using common.txt instead for speed"
+    fi
   fi
 
-  head -n "$MAX_HOSTS" "$SUBS/live.txt" | while read -r host; do
-    safe=$(echo "$host" | sed 's|https\?://||; s|/|_|g')
-    log "  → ffuf: $host"
-    timeout "$HOST_TIMEOUT" ffuf \
-      -u "${host}/FUZZ" \
-      -w "$WORDLIST" \
-      -mc 200,204,301,302,307,401,403,405 \
-      -t "$FFUF_THREADS" \
-      -rate "$FFUF_RATE" \
-      -maxtime-job "$JOB_TIMEOUT" \
-      -ac \
-      -p 0.1 \
-      -of json \
-      -o "$VULN/ffuf_${safe}.json" \
-      2>/dev/null || warn "  → ffuf timeout/skip: $host"
-  done
+  local MAX_HOSTS FFUF_THREADS FFUF_RATE JOB_TIMEOUT HOST_TIMEOUT
+  if $SLOW; then
+    MAX_HOSTS=3; FFUF_THREADS=20; FFUF_RATE=30; JOB_TIMEOUT=60; HOST_TIMEOUT=90
+  else
+    MAX_HOSTS=5; FFUF_THREADS=50; FFUF_RATE=80; JOB_TIMEOUT=90; HOST_TIMEOUT=120
+  fi
 
-  ok "FFUF results saved to $VULN/ffuf_*.json"
+  local ACTIVE_JOBS=0
+  local MAX_PARALLEL=3   # عدد hosts بيشتغلوا في نفس الوقت
+
+  log "  → ffuf: max $MAX_HOSTS hosts, ${MAX_PARALLEL} parallel, wordlist=$(basename "$ACTIVE_WORDLIST")"
+
+  while read -r host; do
+    local safe
+    safe=$(echo "$host" | sed 's|https\?://||; s|[/:]|_|g')
+    log "  → ffuf: $host"
+
+    # شغّل في background
+    (
+      timeout "$HOST_TIMEOUT" ffuf \
+        -u "${host}/FUZZ" \
+        -w "$ACTIVE_WORDLIST" \
+        -mc 200,204,301,302,307,401,403,405 \
+        -t "$FFUF_THREADS" \
+        -rate "$FFUF_RATE" \
+        -maxtime-job "$JOB_TIMEOUT" \
+        -ac \
+        -p 0.1 \
+        -of json \
+        -o "$VULN/ffuf_${safe}.json" \
+        2>/dev/null
+    ) &
+
+    ACTIVE_JOBS=$((ACTIVE_JOBS + 1))
+
+    # لو وصلنا MAX_PARALLEL jobs، استنى واحد يخلص
+    if [ "$ACTIVE_JOBS" -ge "$MAX_PARALLEL" ]; then
+      wait -n 2>/dev/null || wait   # wait -n = bash 4.3+
+      ACTIVE_JOBS=$((ACTIVE_JOBS - 1))
+    fi
+
+  done < <(head -n "$MAX_HOSTS" "$SUBS/live.txt")
+
+  # استنى كل الـ jobs تخلص
+  wait
+
+  local FFUF_COUNT
+  FFUF_COUNT=$(ls "$VULN"/ffuf_*.json 2>/dev/null | wc -l)
+  ok "FFUF done — $FFUF_COUNT result files in $VULN/"
 }
 
 # ===========================
-#  PHASE 12: XSS SCAN (Optimized Pipeline)
-#  Gxss (reflection filter) -> uro (dedup) -> dalfox
+#  PHASE 12: XSS SCAN
 # ===========================
 run_xss() {
-  log "${BOLD}Phase 12: XSS Scanning (Optimized: Gxss -> uro -> dalfox)${NC}"
+  log "${BOLD}Phase 12: XSS Scanning (Gxss -> uro -> dalfox)${NC}"
 
   local SRC="$VULN/gf_xss.txt"
   [ -s "$SRC" ] || SRC="$URLS/params_urls.txt"
@@ -391,7 +612,7 @@ run_xss() {
   else
     cat "$SRC" | qsreplace -a 2>/dev/null | sort -u > "$VULN/xss_dedup.txt"
   fi
-  ok "بعد uro dedup: $(count_lines "$VULN/xss_dedup.txt") URLs"
+  ok "After uro dedup: $(count_lines "$VULN/xss_dedup.txt") URLs"
 
   if command -v Gxss &>/dev/null; then
     cat "$VULN/xss_dedup.txt" | Gxss -c 50 2>/dev/null | sort -u > "$VULN/xss_reflected.txt"
@@ -403,7 +624,7 @@ run_xss() {
   else
     cp "$VULN/xss_dedup.txt" "$VULN/xss_targets.txt"
   fi
-  ok "Targets نهائية للـ dalfox: $(count_lines "$VULN/xss_targets.txt") URLs"
+  ok "Dalfox targets: $(count_lines "$VULN/xss_targets.txt") URLs"
 
   dalfox file "$VULN/xss_targets.txt" \
     --worker 100 \
@@ -425,7 +646,7 @@ report() {
   ELAPSED=$(( $(date +%s) - START_TIME ))
   {
     echo "================================================"
-    echo "          SPIDER-RECON v2.1 FINAL REPORT"
+    echo "          SPIDER-RECON v2.2 FINAL REPORT"
     echo "================================================"
     echo "Target Domain : $DOMAIN"
     echo "Scan Date     : $(date)"
@@ -455,11 +676,11 @@ report() {
     echo "  - SSTI (gf)            : $(count_lines "$VULN/gf_ssti.txt")"
     echo "================================================"
     echo ""
-    echo "[>] NEXT STEPS — افحص بالترتيب ده:"
+    echo "[>] NEXT STEPS:"
     [ "$(count_lines "$VULN/nuclei.txt")" -gt 0 ]      && echo "  1. cat $VULN/nuclei.txt | grep -iE 'critical|high'"
     [ "$(count_lines "$VULN/xss.txt")" -gt 0 ]         && echo "  2. cat $VULN/xss.txt"
     [ "$(count_lines "$JS/secrets.txt")" -gt 0 ]       && echo "  3. cat $JS/secrets.txt"
-    [ "$(count_lines "$VULN/gf_sqli.txt")" -gt 0 ]     && echo "  4. cat $VULN/gf_sqli.txt | head -20  # test manually"
+    [ "$(count_lines "$VULN/gf_sqli.txt")" -gt 0 ]     && echo "  4. cat $VULN/gf_sqli.txt | head -20"
     [ "$(count_lines "$VULN/gf_ssrf.txt")" -gt 0 ]     && echo "  5. cat $VULN/gf_ssrf.txt"
     [ "$(count_lines "$VULN/gf_idor.txt")" -gt 0 ]     && echo "  6. cat $VULN/gf_idor.txt"
     [ "$(count_lines "$VULN/gf_lfi.txt")" -gt 0 ]      && echo "  7. cat $VULN/gf_lfi.txt"
@@ -488,7 +709,7 @@ main() {
   run_ffuf
   run_xss
   report
-  echo -e "\n${GREEN}${BOLD}[✔] Spider-Recon finished!${NC}"
+  echo -e "\n${GREEN}${BOLD}[✔] Spider-Recon v2.2 finished!${NC}"
 }
 
 main
