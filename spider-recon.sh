@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================
-#  Spider-Recon v2.3  -  Bug Bounty Automation
-#  By: Youssef Ashraf  |  Fixed & Optimized Edition
+#  Spider-Recon v2.4  -  Bug Bounty Automation
+#  By: Youssef Ashraf
 # ============================================================
 
 set -o pipefail
@@ -263,7 +263,7 @@ cat << "EOF"
   \___ \| '_ \| |/ _` |/ _ \ '__|  |  _  // _ \/ __/ _ \| '_ \
   ____) | |_) | | (_| |  __/ |     | | \ \  __/ (_| (_) | | | |
  |_____/| .__/|_|\__,_|\___|_|     |_|  \_\___|\___\___/|_| |_|
-        | |              v2.3  -  Bug Bounty Edition
+        | |              v2.4  -  Bug Bounty Edition
         |_|              By: Youssef Ashraf
 EOF
   echo ""
@@ -433,9 +433,11 @@ probe_hosts() {
     return
   fi
 
-  # httpx بياخد hostnames مباشرة وبيجرب http+https لوحده
+  # httpx بياخد hostnames + ports صريحة
+  # بدون -ports بيجرب 80 بس وده السبب في 0 live hosts
   httpx \
     -l "$SUBS/resolved_hosts.txt" \
+    -ports 80,443,8080,8443,8000,8888,3000 \
     -threads "$THREADS" \
     -rate-limit "$RATE_LIMIT" \
     -timeout 10 \
@@ -592,12 +594,10 @@ analyze_js() {
         | grep -oE '(https?://[a-zA-Z0-9._/?=&%#@:_-]+)' \
         >> "$JS/endpoints.txt"
 
-      # secrets — أكثر patterns
+      # secrets — patterns بدون trailing backslash
+      local SECRET_PATTERN='(api[_-]?key|apikey|secret[_-]?key|access[_-]?token|auth[_-]?token|bearer|aws[_-]?access|aws[_-]?secret|client[_-]?secret|password|passwd|private[_-]?key)["\s:=]+[A-Za-z0-9+/=_-]{10,}'
       echo "$body" \
-        | grep -ioE \
-          '(api[_-]?key|apikey|secret[_-]?key|access[_-]?token|auth[_-]?token|\
-bearer|aws[_-]?access|aws[_-]?secret|client[_-]?secret|\
-password|passwd|private[_-]?key)["\s:=]+[A-Za-z0-9+/=_\-]{10,}' \
+        | grep -ioE "$SECRET_PATTERN" \
         | sed "s|^|[JS] $jsurl  ->  |" \
         >> "$JS/secrets.txt"
 
@@ -861,30 +861,37 @@ run_ffuf() {
 }
 
 # ===========================
-#  PHASE 12: XSS SCAN
+#  PHASE 12: XSS PREP
 # ===========================
-# FIX: Pipeline أوضح + fallback منطقي
+# dalfox اتشالت من الأسكريبت عمداً:
+#   - على 3000+ URL بتاخد ساعات بلا نهاية
+#   - هي أداة verification مش discovery
+#   - الأفضل تشغلها يدوي على subset مختار بعد ما تراجع gf_xss.txt
+#
+# الـ phase دي بتعمل:
+#   1. dedup للـ URLs بـ uro
+#   2. فلترة reflective بـ Gxss
+#   3. كتابة command جاهز تشغله يدوي
 # ===========================
 run_xss() {
-  phase "Phase 12: XSS Scanning (Gxss → uro → dalfox)"
+  phase "Phase 12: XSS Prep (Gxss filter → manual dalfox command)"
   phase_start "12"
 
-  # مصدر الـ URLs — xss من gf أولاً، fallback على params
+  # مصدر الـ URLs
   local SRC=""
   if [ -s "$VULN/gf_xss.txt" ]; then
     SRC="$VULN/gf_xss.txt"
-    log "  → Using gf_xss.txt ($(count_lines "$SRC") URLs)"
+    log "  → Source: gf_xss.txt ($(count_lines "$SRC") URLs)"
   elif [ -s "$URLS/params_urls.txt" ]; then
     SRC="$URLS/params_urls.txt"
     log "  → Fallback: params_urls.txt ($(count_lines "$SRC") URLs)"
   else
-    warn "No parameterized URLs for XSS — skipping."
-    touch "$VULN/xss.txt"
+    warn "No parameterized URLs for XSS prep — skipping."
     phase_end "12"
     return
   fi
 
-  # dedup بـ uro أو qsreplace
+  # dedup بـ uro
   if command -v uro &>/dev/null; then
     cat "$SRC" | uro 2>/dev/null | sort -u > "$VULN/xss_dedup.txt"
   else
@@ -892,41 +899,52 @@ run_xss() {
   fi
   ok "After dedup: $(count_lines "$VULN/xss_dedup.txt") URLs"
 
-  # Gxss — فلتر اللي reflective فعلاً
+  # Gxss — فلتر اللي بيعكس input فعلاً (أسرع بكثير من dalfox)
   if command -v Gxss &>/dev/null && [ -s "$VULN/xss_dedup.txt" ]; then
+    log "  → Running Gxss (reflection check)..."
     cat "$VULN/xss_dedup.txt" \
       | Gxss -c 50 2>/dev/null \
       | sort -u > "$VULN/xss_reflected.txt"
-    ok "Gxss reflected: $(count_lines "$VULN/xss_reflected.txt") URLs"
-
-    if [ -s "$VULN/xss_reflected.txt" ]; then
-      cp "$VULN/xss_reflected.txt" "$VULN/xss_targets.txt"
-    else
-      cp "$VULN/xss_dedup.txt" "$VULN/xss_targets.txt"
-    fi
+    ok "Gxss reflected URLs: $(count_lines "$VULN/xss_reflected.txt")"
   else
-    cp "$VULN/xss_dedup.txt" "$VULN/xss_targets.txt"
+    cp "$VULN/xss_dedup.txt" "$VULN/xss_reflected.txt" 2>/dev/null || true
   fi
 
-  ok "Dalfox targets: $(count_lines "$VULN/xss_targets.txt") URLs"
+  # اكتب command جاهز للـ report
+  local DALFOX_SRC="$VULN/xss_reflected.txt"
+  [ ! -s "$DALFOX_SRC" ] && DALFOX_SRC="$VULN/xss_dedup.txt"
 
-  if [ ! -s "$VULN/xss_targets.txt" ]; then
-    warn "No XSS targets to test."
-    touch "$VULN/xss.txt"
-    phase_end "12"
-    return
-  fi
+  cat > "$VULN/run_dalfox.sh" <<DALFOX_CMD
+#!/bin/bash
+# ============================================================
+#  شغّل الكومند ده يدوي بعد ما تراجع الـ URLs
+#  المقترح: اشتغل على أول 100 URL (أسرع وأكثر تركيز)
+# ============================================================
 
-  dalfox file "$VULN/xss_targets.txt" \
-    --worker 50 \
-    --timeout 10 \
-    --delay 100 \
-    --skip-bav \
-    --skip-mining-all \
-    --silence \
-    -o "$VULN/xss.txt" 2>/dev/null || true
+# Option 1: أول 100 URL بس (موصى بيه)
+head -100 "$DALFOX_SRC" | \\
+  dalfox pipe \\
+    --worker 20 \\
+    --timeout 10 \\
+    --delay 200 \\
+    --skip-bav \\
+    --skip-mining-all \\
+    --silence \\
+    -o "$VULN/xss_confirmed.txt"
 
-  ok "XSS findings (dalfox): $(count_lines "$VULN/xss.txt")"
+# Option 2: كل الـ URLs (ممكن يأخد ساعات)
+# dalfox file "$DALFOX_SRC" \\
+#   --worker 20 --timeout 10 --delay 200 \\
+#   --skip-bav --skip-mining-all --silence \\
+#   -o "$VULN/xss_confirmed.txt"
+DALFOX_CMD
+  chmod +x "$VULN/run_dalfox.sh"
+
+  ok "XSS prep done:"
+  ok "  Reflected URLs : $(count_lines "$VULN/xss_reflected.txt")"
+  ok "  Dalfox command : $VULN/run_dalfox.sh  ← شغّله يدوي"
+  warn "  dalfox مش بتشتغل تلقائي — راجع الـ URLs الأول وبعدين شغّل run_dalfox.sh"
+
   phase_end "12"
 }
 
@@ -964,9 +982,10 @@ report() {
     printf "  %-28s : %s\n" "JS Possible Secrets" "$(count_lines "$JS/secrets.txt")"
     echo ""
     echo "── VULNERABILITY CANDIDATES ───────────────────"
-    printf "  %-28s : %s\n" "Nuclei"        "$(count_lines "$VULN/nuclei.txt")"
-    printf "  %-28s : %s\n" "XSS (dalfox)"  "$(count_lines "$VULN/xss.txt")"
-    printf "  %-28s : %s\n" "SQLi (gf)"     "$(count_lines "$VULN/gf_sqli.txt")"
+    printf "  %-28s : %s\n" "Nuclei"               "$(count_lines "$VULN/nuclei.txt")"
+    printf "  %-28s : %s\n" "XSS reflected (Gxss)" "$(count_lines "$VULN/xss_reflected.txt")"
+    printf "  %-28s : %s\n" "XSS confirmed (dalfox)" "run $VULN/run_dalfox.sh manually"
+    printf "  %-28s : %s\n" "SQLi (gf)"            "$(count_lines "$VULN/gf_sqli.txt")"
     printf "  %-28s : %s\n" "SSRF (gf)"     "$(count_lines "$VULN/gf_ssrf.txt")"
     printf "  %-28s : %s\n" "LFI (gf)"      "$(count_lines "$VULN/gf_lfi.txt")"
     printf "  %-28s : %s\n" "RCE (gf)"      "$(count_lines "$VULN/gf_rce.txt")"
@@ -976,9 +995,9 @@ report() {
     printf "  %-28s : %s\n" "FFUF Paths"    "$(count_lines "$VULN/ffuf_all_found.txt")"
     echo ""
     echo "── NEXT STEPS ─────────────────────────────────"
-    [ "$(count_lines "$VULN/nuclei.txt")"      -gt 0 ] && echo "  cat $VULN/nuclei.txt | grep -iE 'critical|high'"
-    [ "$(count_lines "$VULN/xss.txt")"         -gt 0 ] && echo "  cat $VULN/xss.txt"
-    [ "$(count_lines "$JS/secrets.txt")"       -gt 0 ] && echo "  cat $JS/secrets.txt  ← review manually!"
+    [ "$(count_lines "$VULN/nuclei.txt")"        -gt 0 ] && echo "  cat $VULN/nuclei.txt | grep -iE 'critical|high'"
+    [ "$(count_lines "$VULN/xss_reflected.txt")" -gt 0 ] && echo "  bash $VULN/run_dalfox.sh  ← XSS verification (يدوي)"
+    [ "$(count_lines "$JS/secrets.txt")"         -gt 0 ] && echo "  cat $JS/secrets.txt  ← review manually!"
     [ "$(count_lines "$VULN/gf_sqli.txt")"     -gt 0 ] && echo "  cat $VULN/gf_sqli.txt | head -20  → sqlmap"
     [ "$(count_lines "$VULN/gf_ssrf.txt")"     -gt 0 ] && echo "  cat $VULN/gf_ssrf.txt"
     [ "$(count_lines "$VULN/gf_idor.txt")"     -gt 0 ] && echo "  cat $VULN/gf_idor.txt"
