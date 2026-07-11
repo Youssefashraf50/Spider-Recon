@@ -17,6 +17,8 @@ SCOPE_FILE=""
 RATE_LIMIT=150
 START_TIME=$(date +%s)
 NUCLEI_UPDATE_PID=""
+DEEP_PROBE=false
+RUN_GOSPIDER=false
 
 # Timing tracking per phase
 declare -A PHASE_TIMES
@@ -46,11 +48,14 @@ Options:
   -d   Target domain (required)
   -s   Slow mode (lower threads/rate, stealthier)
   -l   Scope file (in-scope domains, one per line)
+  -x   Deep mode (extra httpx ports, katana depth 3, nuclei low severity)
+  -g   Also run gospider alongside katana (extra coverage, slower)
   -h   Show this help
 
 Examples:
   $0 -d example.com
   $0 -d example.com -s -l scope.txt
+  $0 -d example.com -x -g       # full deep scan
 USAGE
 exit 1
 }
@@ -58,11 +63,13 @@ exit 1
 # ===========================
 #  ARGUMENTS
 # ===========================
-while getopts "d:l:sh" opt; do
+while getopts "d:l:sxgh" opt; do
   case $opt in
     d) DOMAIN=$OPTARG ;;
     l) SCOPE_FILE=$OPTARG ;;
     s) SLOW=true ;;
+    x) DEEP_PROBE=true ;;
+    g) RUN_GOSPIDER=true ;;
     h) usage ;;
     *) usage ;;
   esac
@@ -294,50 +301,60 @@ enum_subdomains() {
   phase "Phase 1: Subdomain Enumeration"
   phase_start "1"
 
-  log "  → subfinder..."
-  timeout 180 subfinder -d "$DOMAIN" -all -silent \
-    -o "$SUBS/subfinder.txt" 2>/dev/null \
-    || { warn "subfinder timed out"; touch "$SUBS/subfinder.txt"; }
+  # -------------------------------------------------------
+  # PERFORMANCE FIX: الأربع مصادر دي مستقلين عن بعض تمامًا،
+  # فبدل ما نستناهم واحد واحد (180+90+135+240 = ~10 دقايق)
+  # بنشغلهم كلهم في الخلفية مع بعض ونستنى أبطأ واحد بس.
+  # ده لوحده بيقلل وقت المرحلة دي من ~10 دقايق لـ ~4 دقايق.
+  # -------------------------------------------------------
+  log "  → Launching subfinder + assetfinder + crt.sh + amass in parallel..."
 
-  log "  → assetfinder..."
-  timeout 90 assetfinder --subs-only "$DOMAIN" 2>/dev/null \
-    > "$SUBS/assetfinder.txt" \
-    || { warn "assetfinder timed out"; touch "$SUBS/assetfinder.txt"; }
+  ( timeout 180 subfinder -d "$DOMAIN" -all -silent \
+      -o "$SUBS/subfinder.txt" 2>/dev/null \
+      || { warn "subfinder timed out"; touch "$SUBS/subfinder.txt"; } ) &
+  local PID_SUB=$!
 
-  # crt.sh — retry x3
-  log "  → crt.sh..."
-  touch "$SUBS/crtsh.txt"
-  for attempt in 1 2 3; do
-    local RAW
-    RAW=$(timeout 45 curl -s -L \
-      -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64)" \
-      --retry 2 --retry-delay 3 \
-      "https://crt.sh/?q=%25.$DOMAIN&output=json" 2>/dev/null)
+  ( timeout 90 assetfinder --subs-only "$DOMAIN" 2>/dev/null \
+      > "$SUBS/assetfinder.txt" \
+      || { warn "assetfinder timed out"; touch "$SUBS/assetfinder.txt"; } ) &
+  local PID_ASSET=$!
 
-    if echo "$RAW" | grep -q "name_value"; then
-      echo "$RAW" \
-        | grep -oP '"name_value"\s*:\s*"\K[^"]+' \
-        | tr ',' '\n' \
-        | sed 's/^\*\.//' \
-        | grep -E "(^|\.)${DOMAIN}$" \
-        | sort -u > "$SUBS/crtsh.txt"
-      ok "crt.sh: $(count_lines "$SUBS/crtsh.txt") subdomains"
-      break
-    fi
-    warn "crt.sh attempt $attempt failed, retrying..."
-    sleep 5
-  done
+  (
+    touch "$SUBS/crtsh.txt"
+    for attempt in 1 2 3; do
+      RAW=$(timeout 45 curl -s -L \
+        -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64)" \
+        --retry 2 --retry-delay 3 \
+        "https://crt.sh/?q=%25.$DOMAIN&output=json" 2>/dev/null)
 
-  # amass — passive فقط
+      if echo "$RAW" | grep -q "name_value"; then
+        echo "$RAW" \
+          | grep -oP '"name_value"\s*:\s*"\K[^"]+' \
+          | tr ',' '\n' \
+          | sed 's/^\*\.//' \
+          | grep -E "(^|\.)${DOMAIN}$" \
+          | sort -u > "$SUBS/crtsh.txt"
+        break
+      fi
+      sleep 5
+    done
+  ) &
+  local PID_CRT=$!
+
   if [ "$SLOW" = false ]; then
-    log "  → amass (passive, 4min timeout)..."
-    timeout 240 amass enum -passive -d "$DOMAIN" -timeout 3 -silent \
-      2>/dev/null > "$SUBS/amass.txt" \
-      || { warn "amass timed out"; touch "$SUBS/amass.txt"; }
+    ( timeout 240 amass enum -passive -d "$DOMAIN" -timeout 3 -silent \
+        2>/dev/null > "$SUBS/amass.txt" \
+        || { warn "amass timed out"; touch "$SUBS/amass.txt"; } ) &
+    local PID_AMASS=$!
   else
     warn "  → amass skipped in slow mode"
     touch "$SUBS/amass.txt"
+    local PID_AMASS=""
   fi
+
+  wait "$PID_SUB" "$PID_ASSET" "$PID_CRT" ${PID_AMASS:+$PID_AMASS} 2>/dev/null
+
+  ok "subfinder: $(count_lines "$SUBS/subfinder.txt")  assetfinder: $(count_lines "$SUBS/assetfinder.txt")  crt.sh: $(count_lines "$SUBS/crtsh.txt")  amass: $(count_lines "$SUBS/amass.txt")"
 
   # دمج + فلترة scope
   cat "$SUBS"/*.txt 2>/dev/null \
@@ -417,10 +434,11 @@ scan_ports() {
 # ===========================
 #  PHASE 3: PROBE LIVE HOSTS
 # ===========================
-# FIX: المشكلة الأصلية كانت إن httpx بياخد http+https لكل subdomain
-# وده بيضاعف الـ load ويخلي الـ results فيها تكرار.
-# الحل: httpx بيجرب الاتنين لوحده لو مش اتحدد protocol.
-# بس لازم نديه الأسماء بدون proto وهو يشوف.
+# PERFORMANCE FIX: كنا بنحدد 7 ports صريحة (80,443,8080,8443,
+# 8000,8888,3000) لكل host، وده بيضاعف وقت الـ probing 7 مرات
+# حتى لو أغلب الـ hosts شغالة بس على 80/443.
+# دلوقتي: افتراضيًا بنسيب httpx يجرب 80/443 بس (سريع)،
+# ولو عايز فحص الـ ports الإضافية استخدم -x (deep probe).
 # ===========================
 probe_hosts() {
   phase "Phase 3: Probing Live Hosts"
@@ -433,11 +451,17 @@ probe_hosts() {
     return
   fi
 
-  # httpx بياخد hostnames + ports صريحة
-  # بدون -ports بيجرب 80 بس وده السبب في 0 live hosts
+  local PORT_ARGS=()
+  if [ "$DEEP_PROBE" = true ]; then
+    log "  → Deep probe: checking 80,443,8080,8443,8000,8888,3000"
+    PORT_ARGS=(-ports "80,443,8080,8443,8000,8888,3000")
+  else
+    log "  → Fast probe: checking 80,443 only (use -x for extra ports)"
+  fi
+
   httpx \
     -l "$SUBS/resolved_hosts.txt" \
-    -ports 80,443,8080,8443,8000,8888,3000 \
+    "${PORT_ARGS[@]}" \
     -threads "$THREADS" \
     -rate-limit "$RATE_LIMIT" \
     -timeout 10 \
@@ -480,7 +504,7 @@ collect_urls() {
 
   if [ -s "$SUBS/live.txt" ]; then
     cat "$SUBS/live.txt" \
-      | gau --threads "$THREADS" --subs 2>/dev/null \
+      | timeout 180 gau --threads "$THREADS" --subs 2>/dev/null \
       | anew "$URLS/gau.txt" >/dev/null || true
     ok "GAU URLs: $(count_lines "$URLS/gau.txt")"
   else
@@ -489,19 +513,30 @@ collect_urls() {
   fi
 
   cat "$SUBS/resolved_hosts.txt" \
-    | waybackurls 2>/dev/null \
+    | timeout 120 waybackurls 2>/dev/null \
     | anew "$URLS/wayback.txt" >/dev/null || true
   ok "Wayback URLs: $(count_lines "$URLS/wayback.txt")"
 
   phase_end "4"
 
-  phase "Phase 5: Active Crawling (katana + gospider)"
+  phase "Phase 5: Active Crawling (katana)"
   phase_start "5"
+
+  # -------------------------------------------------------
+  # PERFORMANCE FIX: كانت -d 3 (عمق 3) + katana + gospider
+  # شغالين على كل الـ live hosts، وده بيعمل تكرار مجهود لأن
+  # الأداتين بيعملوا نفس الشغل (crawling) تقريبًا.
+  # دلوقتي: katana بس بعمق 2 افتراضيًا (كافي لـ recon أولي)،
+  # وgospider بقى اختياري (-g) لو محتاج تغطية إضافية.
+  # لو عايز عمق أكبر استخدم -x (deep mode).
+  # -------------------------------------------------------
+  local KATANA_DEPTH=2
+  [ "$DEEP_PROBE" = true ] && KATANA_DEPTH=3
 
   if [ -s "$SUBS/live.txt" ]; then
     katana \
       -list "$SUBS/live.txt" \
-      -d 3 \
+      -d "$KATANA_DEPTH" \
       -jc \
       -kf all \
       -c "$THREADS" \
@@ -509,9 +544,10 @@ collect_urls() {
       -timeout 10 \
       -silent \
       -o "$URLS/katana.txt" 2>/dev/null || true
-    ok "Katana URLs: $(count_lines "$URLS/katana.txt")"
+    ok "Katana URLs (depth $KATANA_DEPTH): $(count_lines "$URLS/katana.txt")"
 
-    if command -v gospider &>/dev/null; then
+    if [ "$RUN_GOSPIDER" = true ] && command -v gospider &>/dev/null; then
+      log "  → gospider (extra coverage, -g enabled)..."
       gospider \
         -S "$SUBS/live.txt" \
         -c 10 -d 2 \
@@ -520,6 +556,8 @@ collect_urls() {
         | grep -oE 'https?://[^ ]+' \
         | anew "$URLS/gospider.txt" >/dev/null || true
       ok "GoSpider URLs: $(count_lines "$URLS/gospider.txt")"
+    else
+      touch "$URLS/gospider.txt"
     fi
   else
     touch "$URLS/katana.txt" "$URLS/gospider.txt"
@@ -532,7 +570,7 @@ collect_urls() {
   phase_start "6"
 
   if command -v paramspider &>/dev/null; then
-    paramspider -d "$DOMAIN" -q 2>/dev/null
+    timeout 120 paramspider -d "$DOMAIN" -q 2>/dev/null
     local PARAM_RESULT
     for f in "results/$DOMAIN.txt" "output/$DOMAIN.txt"; do
       [ -f "$f" ] && PARAM_RESULT="$f" && break
@@ -561,6 +599,12 @@ collect_urls() {
 # ===========================
 #  PHASE 7: JS ANALYSIS
 # ===========================
+# PERFORMANCE FIX: كان فيه loop بيعمل curl لكل ملف JS
+# بالتتابع (sequential) — على 200 ملف بـ timeout 10s ده ممكن
+# ياخد لحد 33 دقيقة. دلوقتي بنجيب الملفات بالتوازي (10 في
+# نفس الوقت) عن طريق background jobs محكومة بـ wait_jobs،
+# فالوقت بيقل من ~33 دقيقة لـ ~3-4 دقايق على نفس الـ 200 ملف.
+# ===========================
 analyze_js() {
   phase "Phase 7: JavaScript Analysis"
   phase_start "7"
@@ -570,38 +614,49 @@ analyze_js() {
 
   if [ -s "$SUBS/live.txt" ] && command -v subjs &>/dev/null; then
     cat "$SUBS/live.txt" \
-      | subjs 2>/dev/null \
+      | timeout 60 subjs 2>/dev/null \
       | anew "$JS/js_urls.txt" >/dev/null || true
   fi
 
   ok "JS files found: $(count_lines "$JS/js_urls.txt")"
 
   if [ -s "$JS/js_urls.txt" ]; then
+    : > "$JS/endpoints.txt"
+    : > "$JS/secrets.txt"
+    local JS_PARALLEL=10
+    local SECRET_PATTERN='(api[_-]?key|apikey|secret[_-]?key|access[_-]?token|auth[_-]?token|bearer|aws[_-]?access|aws[_-]?secret|client[_-]?secret|password|passwd|private[_-]?key)["\s:=]+[A-Za-z0-9+/=_-]{10,}'
+
+    fetch_js_one() {
+      local jsurl="$1"
+      local body
+      body=$(curl -s -m 8 -L \
+        -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64)" \
+        "$jsurl" 2>/dev/null)
+      [ -z "$body" ] && return
+
+      echo "$body" \
+        | grep -oE '(https?://[a-zA-Z0-9._/?=&%#@:_-]+)' \
+        >> "$JS/endpoints.txt"
+
+      echo "$body" \
+        | grep -ioE "$SECRET_PATTERN" \
+        | sed "s|^|[JS] $jsurl  ->  |" \
+        >> "$JS/secrets.txt"
+    }
+    export -f fetch_js_one 2>/dev/null
+
     local count=0
     while IFS= read -r jsurl; do
       (( count++ ))
       [ "$count" -gt 200 ] && break
 
-      local body
-      body=$(curl -s -m 10 -L \
-        -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64)" \
-        "$jsurl" 2>/dev/null)
+      fetch_js_one "$jsurl" &
 
-      [ -z "$body" ] && continue
-
-      # endpoints
-      echo "$body" \
-        | grep -oE '(https?://[a-zA-Z0-9._/?=&%#@:_-]+)' \
-        >> "$JS/endpoints.txt"
-
-      # secrets — patterns بدون trailing backslash
-      local SECRET_PATTERN='(api[_-]?key|apikey|secret[_-]?key|access[_-]?token|auth[_-]?token|bearer|aws[_-]?access|aws[_-]?secret|client[_-]?secret|password|passwd|private[_-]?key)["\s:=]+[A-Za-z0-9+/=_-]{10,}'
-      echo "$body" \
-        | grep -ioE "$SECRET_PATTERN" \
-        | sed "s|^|[JS] $jsurl  ->  |" \
-        >> "$JS/secrets.txt"
-
+      if [ "$(jobs -r | wc -l)" -ge "$JS_PARALLEL" ]; then
+        wait_jobs "$JS_PARALLEL"
+      fi
     done < "$JS/js_urls.txt"
+    wait
 
     [ -f "$JS/endpoints.txt" ] && sort -u -o "$JS/endpoints.txt" "$JS/endpoints.txt"
     [ -f "$JS/secrets.txt"   ] && sort -u -o "$JS/secrets.txt" "$JS/secrets.txt"
@@ -701,11 +756,10 @@ gf_patterns() {
 # ===========================
 #  PHASE 10: NUCLEI
 # ===========================
-# FIX:
-#   - انتظر templates update
-#   - بيشتغل على live.txt مع limit معقول
-#   - بيحدد severity
-#   - بيكتب errors منفصلة
+# PERFORMANCE FIX: كان بيشغل severity من low لحد critical.
+# low بتجيب noise كتير (info disclosure ضعيف، إلخ) من غير
+# فايدة حقيقية في bug bounty. افتراضيًا بقى medium+ بس،
+# واستخدم -x لو عايز full severity range.
 # ===========================
 run_nuclei() {
   phase "Phase 10: Nuclei Scanning"
@@ -738,11 +792,14 @@ run_nuclei() {
     return
   fi
 
-  log "  → Running nuclei on $(count_lines "$SUBS/live.txt") targets..."
+  local SEVERITY="medium,high,critical"
+  [ "$DEEP_PROBE" = true ] && SEVERITY="low,medium,high,critical"
+
+  log "  → Running nuclei on $(count_lines "$SUBS/live.txt") targets (severity: $SEVERITY)..."
 
   nuclei \
     -l "$SUBS/live.txt" \
-    -severity low,medium,high,critical \
+    -severity "$SEVERITY" \
     -rl "$RATE_LIMIT" \
     -c "$THREADS" \
     -timeout 10 \
@@ -766,16 +823,6 @@ run_nuclei() {
 
 # ===========================
 #  PHASE 11: FFUF
-# ===========================
-# FIX: المشكلة الأصلية:
-#   - "wait -n" مش شغالة في bash < 4.3
-#   - بياخد wordlist كبيرة حتى لو في خيار أصغر
-#   - مفيش timeout على كل host بشكل صريح
-#
-# الحل:
-#   - wait_jobs() portable بدون "wait -n"
-#   - اختيار تلقائي لأصغر wordlist متاحة
-#   - timeout واضح لكل job
 # ===========================
 run_ffuf() {
   phase "Phase 11: Content Discovery (ffuf)"
@@ -833,23 +880,19 @@ run_ffuf() {
 
     ACTIVE_JOBS=$((ACTIVE_JOBS + 1))
 
-    # wait_jobs portable — بدل "wait -n"
     if [ "$ACTIVE_JOBS" -ge "$MAX_PARALLEL" ]; then
       wait_jobs "$MAX_PARALLEL"
-      # مش بنقلل ACTIVE_JOBS هنا لأن wait_jobs بتستنى لحد ما يقل
       ACTIVE_JOBS=$(jobs -r 2>/dev/null | wc -l)
     fi
 
   done < <(head -n "$MAX_HOSTS" "$SUBS/live.txt")
 
-  # استنى كل background jobs
   wait
 
   local FFUF_FILES
   FFUF_FILES=$(ls "$VULN"/ffuf_*.json 2>/dev/null | wc -l)
   ok "FFUF done — $FFUF_FILES result files in $VULN/"
 
-  # استخرج الـ paths الفعلية من JSON
   if [ "$FFUF_FILES" -gt 0 ]; then
     for f in "$VULN"/ffuf_*.json; do
       grep -oP '"url"\s*:\s*"\K[^"]+' "$f" 2>/dev/null
@@ -863,21 +906,10 @@ run_ffuf() {
 # ===========================
 #  PHASE 12: XSS PREP
 # ===========================
-# dalfox اتشالت من الأسكريبت عمداً:
-#   - على 3000+ URL بتاخد ساعات بلا نهاية
-#   - هي أداة verification مش discovery
-#   - الأفضل تشغلها يدوي على subset مختار بعد ما تراجع gf_xss.txt
-#
-# الـ phase دي بتعمل:
-#   1. dedup للـ URLs بـ uro
-#   2. فلترة reflective بـ Gxss
-#   3. كتابة command جاهز تشغله يدوي
-# ===========================
 run_xss() {
   phase "Phase 12: XSS Prep (Gxss filter → manual dalfox command)"
   phase_start "12"
 
-  # مصدر الـ URLs
   local SRC=""
   if [ -s "$VULN/gf_xss.txt" ]; then
     SRC="$VULN/gf_xss.txt"
@@ -891,7 +923,6 @@ run_xss() {
     return
   fi
 
-  # dedup بـ uro
   if command -v uro &>/dev/null; then
     cat "$SRC" | uro 2>/dev/null | sort -u > "$VULN/xss_dedup.txt"
   else
@@ -899,7 +930,6 @@ run_xss() {
   fi
   ok "After dedup: $(count_lines "$VULN/xss_dedup.txt") URLs"
 
-  # Gxss — فلتر اللي بيعكس input فعلاً (أسرع بكثير من dalfox)
   if command -v Gxss &>/dev/null && [ -s "$VULN/xss_dedup.txt" ]; then
     log "  → Running Gxss (reflection check)..."
     cat "$VULN/xss_dedup.txt" \
@@ -910,7 +940,6 @@ run_xss() {
     cp "$VULN/xss_dedup.txt" "$VULN/xss_reflected.txt" 2>/dev/null || true
   fi
 
-  # اكتب command جاهز للـ report
   local DALFOX_SRC="$VULN/xss_reflected.txt"
   [ ! -s "$DALFOX_SRC" ] && DALFOX_SRC="$VULN/xss_dedup.txt"
 
@@ -958,7 +987,7 @@ report() {
 
   {
     echo "================================================"
-    echo "       SPIDER-RECON v2.3 — FINAL REPORT"
+    echo "       SPIDER-RECON v2.5 — FINAL REPORT"
     echo "================================================"
     echo "Target   : $DOMAIN"
     echo "Date     : $(date)"
@@ -1028,7 +1057,7 @@ main() {
   run_ffuf
   run_xss
   report
-  echo -e "\n${GREEN}${BOLD}[✔] Spider-Recon v2.3 done! Output: $OUT${NC}"
+  echo -e "\n${GREEN}${BOLD}[✔] Spider-Recon v2.5 done! Output: $OUT${NC}"
 }
 
 main
