@@ -20,6 +20,14 @@ NUCLEI_UPDATE_PID=""
 DEEP_PROBE=false
 RUN_GOSPIDER=false
 RUN_AMASS=false
+RESET=false
+STATE_FILE=""
+LOCK_FILE=""
+TOTAL_PHASES=10
+TOTAL_PHASES_DONE=0
+CURRENT_PHASE_NAME=""
+CURRENT_ITEM=0
+CURRENT_TOTAL=0
 
 # Timing tracking per phase
 declare -A PHASE_TIMES
@@ -52,12 +60,15 @@ Options:
   -x   Deep mode (extra httpx ports, katana depth 3, nuclei low severity)
   -g   Also run gospider alongside katana (extra coverage, slower)
   -a   Also run amass passive enum (slow, often redundant with subfinder -all)
+  -r   Reset — ignore any saved checkpoint and start fully from scratch
   -h   Show this help
 
 Examples:
   $0 -d example.com
   $0 -d example.com -s -l scope.txt
   $0 -d example.com -x -g -a    # full deep scan, everything on
+  $0 -d example.com             # run again with same domain → auto-resumes
+  $0 -d example.com -r          # force restart, ignore checkpoint
 USAGE
 exit 1
 }
@@ -65,7 +76,7 @@ exit 1
 # ===========================
 #  ARGUMENTS
 # ===========================
-while getopts "d:l:sxgah" opt; do
+while getopts "d:l:sxgarh" opt; do
   case $opt in
     d) DOMAIN=$OPTARG ;;
     l) SCOPE_FILE=$OPTARG ;;
@@ -73,6 +84,7 @@ while getopts "d:l:sxgah" opt; do
     x) DEEP_PROBE=true ;;
     g) RUN_GOSPIDER=true ;;
     a) RUN_AMASS=true ;;
+    r) RESET=true ;;
     h) usage ;;
     *) usage ;;
   esac
@@ -119,15 +131,162 @@ count_lines() {
   fi
 }
 
-# portable wait: استنى لحد ما عدد background jobs يقل عن MAX
+# ===========================
+#  STATE FILE (checkpoint) / RESUME / LOCK
+# ===========================
+# كل حالة السكريبت (المراحل المخلصة + تقدم داخل المراحل الطويلة)
+# متخزنة في ملف JSON واحد: output/<domain>/.state.json
+# بدل ملفات متفرقة. بيحتوي على checkpoint_version عشان لو
+# اتغيرت طريقة الحفظ مستقبلاً، السكريبت يعرف يتعامل مع
+# state files قديمة بدل ما يكسر أو يقرأها غلط.
+CHECKPOINT_VERSION=1
+
+ensure_jq() {
+  if ! command -v jq &>/dev/null; then
+    warn "jq not found (needed for state file) — installing..."
+    (sudo apt-get install -y jq || apt-get install -y jq) &>/dev/null
+    if ! command -v jq &>/dev/null; then
+      err "Could not install jq automatically. Install it manually: sudo apt install jq"
+      exit 1
+    fi
+  fi
+  ok "jq ✓"
+}
+
+init_state() {
+  STATE_FILE="$OUT/.state.json"
+  LOCK_FILE="$OUT/.lock"
+
+  if [ "$RESET" = true ]; then
+    warn "Reset (-r) requested — clearing saved state, starting fresh."
+    rm -f "$STATE_FILE" "$JS/.in_progress" "$VULN/.in_progress"
+  fi
+
+  if [ ! -f "$STATE_FILE" ]; then
+    jq -n --argjson ver "$CHECKPOINT_VERSION" --arg sv "2.9" --arg d "$DOMAIN" --arg t "$(date -Iseconds)" \
+      '{checkpoint_version:$ver, script_version:$sv, domain:$d, completed_phases:[], progress:{}, started_at:$t, updated_at:$t}' \
+      > "$STATE_FILE"
+    return
+  fi
+
+  local ver
+  ver=$(jq -r '.checkpoint_version // 0' "$STATE_FILE" 2>/dev/null)
+  if [ "$ver" != "$CHECKPOINT_VERSION" ]; then
+    warn "State file format is old/incompatible (v$ver) — starting fresh (old file kept as .bak)."
+    cp "$STATE_FILE" "${STATE_FILE}.v${ver}.bak" 2>/dev/null
+    jq -n --argjson ver "$CHECKPOINT_VERSION" --arg sv "2.9" --arg d "$DOMAIN" --arg t "$(date -Iseconds)" \
+      '{checkpoint_version:$ver, script_version:$sv, domain:$d, completed_phases:[], progress:{}, started_at:$t, updated_at:$t}' \
+      > "$STATE_FILE"
+  else
+    ok "Found previous run for $DOMAIN — resuming from saved state."
+    ok "  Completed so far: $(jq -r '.completed_phases | join(", ")' "$STATE_FILE" 2>/dev/null)"
+  fi
+}
+
+# state_set '.progress.js.last_index' 80   ← الـ value لازم تبقى JSON صحيح
+state_set() {
+  local jq_path="$1" jq_value="$2"
+  local tmp
+  tmp=$(mktemp)
+  jq "$jq_path = $jq_value | .updated_at = \"$(date -Iseconds)\"" "$STATE_FILE" > "$tmp" 2>/dev/null && mv "$tmp" "$STATE_FILE"
+}
+
+state_get() {
+  jq -r "$1 // empty" "$STATE_FILE" 2>/dev/null
+}
+
+# lock بسيط عشان تشغيلتين للسكريبت على نفس الدومين في نفس
+# الوقت ميكتبوش على نفس الملفات مع بعض
+acquire_lock() {
+  if [ -f "$LOCK_FILE" ]; then
+    local old_pid
+    old_pid=$(cat "$LOCK_FILE" 2>/dev/null)
+    if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+      err "Another scan for $DOMAIN is already running (PID $old_pid)."
+      err "If you're sure it's not, delete: $LOCK_FILE"
+      exit 1
+    else
+      warn "Stale lock file found (process $old_pid not running) — removing it."
+    fi
+  fi
+  echo $$ > "$LOCK_FILE"
+}
+
+release_lock() {
+  [ -n "$LOCK_FILE" ] && rm -f "$LOCK_FILE" 2>/dev/null
+}
+
+# is_phase_done: أول حاجة بيشوفها هي الـ state file نفسه.
+# لو مش لاقيها هناك (مثلاً الملف اتحذف بالغلط)، بيعمل "recovery"
+# عن طريق فحص لو ملف النتيجة الحقيقي بتاع المرحلة موجود وغير
+# فاضي — لو أيوه، يبقى المرحلة خلصت فعلاً ومفيش داعي تتعاد.
+is_phase_done() {
+  local phase="$1"
+  if jq -e --arg p "$phase" '.completed_phases | index($p) != null' "$STATE_FILE" >/dev/null 2>&1; then
+    return 0
+  fi
+  case "$phase" in
+    subdomains) [ -s "$SUBS/resolved_hosts.txt" ] ;;
+    ports)      [ -f "$PORTS/naabu.txt" ] ;;
+    probe)      [ -s "$SUBS/live_detailed.txt" ] ;;
+    urls)       [ -s "$URLS/all_urls.txt" ] ;;
+    js)         [ -f "$JS/js_urls.txt" ] && [ ! -f "$JS/.in_progress" ] ;;
+    filter)     [ -f "$URLS/params_urls.txt" ] ;;
+    gf)         [ -f "$VULN/gf_sqli.txt" ] ;;
+    nuclei)     [ -f "$VULN/nuclei.txt" ] ;;
+    ffuf)       [ -f "$VULN/ffuf_all_found.txt" ] && [ ! -f "$VULN/.in_progress" ] ;;
+    xss)        [ -f "$VULN/xss_dedup.txt" ] ;;
+    *) return 1 ;;
+  esac
+}
+
+mark_phase_done() {
+  local phase="$1"
+  local tmp
+  tmp=$(mktemp)
+  jq --arg p "$phase" --arg t "$(date -Iseconds)" \
+    '.completed_phases = ((.completed_phases + [$p]) | unique) | .updated_at = $t' \
+    "$STATE_FILE" > "$tmp" 2>/dev/null && mv "$tmp" "$STATE_FILE"
+}
+
+run_phase() {
+  local name="$1"
+  shift
+  TOTAL_PHASES_DONE=$((TOTAL_PHASES_DONE + 1))
+  CURRENT_PHASE_NAME="$name"
+  if is_phase_done "$name"; then
+    ok "⏭  [$TOTAL_PHASES_DONE/$TOTAL_PHASES] Skipping '$name' — already completed"
+    mark_phase_done "$name"   # يسجلها لو كانت مكتشفة بالـ recovery بس مش مسجلة في الـ state
+    return
+  fi
+  log "${BOLD}[$TOTAL_PHASES_DONE/$TOTAL_PHASES — $(( TOTAL_PHASES_DONE * 100 / TOTAL_PHASES ))%] Starting '$name'...${NC}"
+  "$@"
+  mark_phase_done "$name"
+}
+
+# إدارة parallel jobs: بنستخدم "wait -n" (بتستنى أول job يخلص بس،
+# مش كلهم) لو bash بتاعنا بيدعمها (4.3+) — ده أسرع وأخف على
+# المعالج من الـ polling loop القديم، وبيقلل احتمالية إن jobs
+# تتعلق فاضية. لو bash قديمة، بيرجع للـ polling القديم كـ fallback.
+BASH_SUPPORTS_WAIT_N=false
+if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3) )); then
+  BASH_SUPPORTS_WAIT_N=true
+fi
+
 wait_jobs() {
   local max="${1:-$MAX_PARALLEL}"
-  while true; do
-    local running
-    running=$(jobs -r 2>/dev/null | wc -l)
-    [ "$running" -lt "$max" ] && break
-    sleep 0.3
-  done
+  if [ "$BASH_SUPPORTS_WAIT_N" = true ]; then
+    while [ "$(jobs -rp | wc -l)" -ge "$max" ]; do
+      wait -n 2>/dev/null || break
+    done
+  else
+    while true; do
+      local running
+      running=$(jobs -r 2>/dev/null | wc -l)
+      [ "$running" -lt "$max" ] && break
+      sleep 0.3
+    done
+  fi
 }
 
 phase_start() {
@@ -161,11 +320,19 @@ in_scope() {
 check_tool() {
   local TOOL=$1
   local INSTALL_CMD=$2
+  local FALLBACK_CMD=$3
   if ! command -v "$TOOL" &>/dev/null; then
-    warn "$TOOL not found — installing..."
-    eval "$INSTALL_CMD" &>/dev/null \
-      && ok "$TOOL installed." \
-      || err "Failed to install $TOOL (continuing)."
+    warn "$TOOL not found — installing (pinned version)..."
+    if eval "$INSTALL_CMD" &>/dev/null; then
+      ok "$TOOL installed."
+    elif [ -n "$FALLBACK_CMD" ]; then
+      warn "Pinned install failed for $TOOL — falling back to @latest..."
+      eval "$FALLBACK_CMD" &>/dev/null \
+        && ok "$TOOL installed (latest)." \
+        || err "Failed to install $TOOL (continuing)."
+    else
+      err "Failed to install $TOOL (continuing)."
+    fi
   else
     ok "$TOOL ✓"
   fi
@@ -185,7 +352,7 @@ install_dependencies() {
   check_tool katana      "go install github.com/projectdiscovery/katana/cmd/katana@latest"
   check_tool gospider    "go install github.com/jaeles-project/gospider@latest"
   check_tool nuclei      "go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest"
-  check_tool ffuf        "go install github.com/ffuf/ffuf/v2@latest"
+  check_tool ffuf         "go install github.com/ffuf/ffuf/v2@v2.1.0" "go install github.com/ffuf/ffuf/v2@latest"
   check_tool dalfox      "go install github.com/hahwul/dalfox/v2@latest"
   check_tool gf          "go install github.com/tomnomnom/gf@latest"
   check_tool qsreplace   "go install github.com/tomnomnom/qsreplace@latest"
@@ -298,6 +465,10 @@ setup_dirs() {
   JS="$OUT/js"
   PORTS="$OUT/ports"
   mkdir -p "$SUBS" "$URLS" "$VULN" "$JS" "$PORTS"
+
+  init_state
+  acquire_lock
+
   ok "Output directory: $OUT"
 }
 
@@ -676,8 +847,25 @@ analyze_js() {
   ok "JS files found: $(count_lines "$JS/js_urls.txt")"
 
   if [ -s "$JS/js_urls.txt" ]; then
-    : > "$JS/endpoints.txt"
-    : > "$JS/secrets.txt"
+    local TOTAL_JS
+    TOTAL_JS=$(count_lines "$JS/js_urls.txt")
+    [ "$TOTAL_JS" -gt 200 ] && TOTAL_JS=200
+    CURRENT_TOTAL=$TOTAL_JS
+
+    # last_index في state.json = آخر عنصر اتأكدنا إنه خلص بالكامل
+    # (بعد ما دفعة كاملة من الـ parallel jobs تخلص وnستنى wait).
+    local START_INDEX
+    START_INDEX=$(state_get '.progress.js.last_index')
+    [ -z "$START_INDEX" ] && START_INDEX=0
+
+    if [ "$START_INDEX" -eq 0 ]; then
+      : > "$JS/endpoints.txt"
+      : > "$JS/secrets.txt"
+    else
+      log "  → Resuming JS analysis from item $START_INDEX/$TOTAL_JS"
+    fi
+    touch "$JS/.in_progress"
+
     local JS_PARALLEL=10
     local SECRET_PATTERN='(api[_-]?key|apikey|secret[_-]?key|access[_-]?token|auth[_-]?token|bearer|aws[_-]?access|aws[_-]?secret|client[_-]?secret|password|passwd|private[_-]?key)["\s:=]+[A-Za-z0-9+/=_-]{10,}'
 
@@ -687,16 +875,17 @@ analyze_js() {
       body=$(curl -s -m 8 -L \
         -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64)" \
         "$jsurl" 2>/dev/null)
-      [ -z "$body" ] && return
 
-      echo "$body" \
-        | grep -oE '(https?://[a-zA-Z0-9._/?=&%#@:_-]+)' \
-        >> "$JS/endpoints.txt"
+      if [ -n "$body" ]; then
+        echo "$body" \
+          | grep -oE '(https?://[a-zA-Z0-9._/?=&%#@:_-]+)' \
+          >> "$JS/endpoints.txt"
 
-      echo "$body" \
-        | grep -ioE "$SECRET_PATTERN" \
-        | sed "s|^|[JS] $jsurl  ->  |" \
-        >> "$JS/secrets.txt"
+        echo "$body" \
+          | grep -ioE "$SECRET_PATTERN" \
+          | sed "s|^|[JS] $jsurl  ->  |" \
+          >> "$JS/secrets.txt"
+      fi
     }
     export -f fetch_js_one 2>/dev/null
 
@@ -704,17 +893,27 @@ analyze_js() {
     while IFS= read -r jsurl; do
       (( count++ ))
       [ "$count" -gt 200 ] && break
+      [ "$count" -le "$START_INDEX" ] && continue   # اتعالج خلاص في محاولة سابقة
 
+      CURRENT_ITEM=$count
+      printf "\r  → JS fetch progress: %d/%d" "$count" "$TOTAL_JS"
       fetch_js_one "$jsurl" &
 
-      if [ "$(jobs -r | wc -l)" -ge "$JS_PARALLEL" ]; then
-        wait_jobs "$JS_PARALLEL"
+      # كل JS_PARALLEL عنصر، نستنى الدفعة تخلص بالكامل (barrier)
+      # وبعدين نسجل last_index — ده بيضمن إن الرقم المسجل دقيق
+      # 100%، مش تخمين وسط شغل لسه جاري.
+      if (( count % JS_PARALLEL == 0 )); then
+        wait
+        state_set '.progress.js.last_index' "$count"
       fi
     done < "$JS/js_urls.txt"
     wait
+    echo ""   # سطر جديد بعد الـ progress counter
+    state_set '.progress.js.last_index' "$count"
 
     [ -f "$JS/endpoints.txt" ] && sort -u -o "$JS/endpoints.txt" "$JS/endpoints.txt"
     [ -f "$JS/secrets.txt"   ] && sort -u -o "$JS/secrets.txt" "$JS/secrets.txt"
+    rm -f "$JS/.in_progress"   # المرحلة خلصت بنجاح بالكامل
 
     local SECRET_COUNT
     SECRET_COUNT=$(count_lines "$JS/secrets.txt")
@@ -910,12 +1109,23 @@ run_ffuf() {
 
   log "  → ffuf: $MAX_HOSTS hosts, $MAX_PARALLEL parallel, $(basename "$ACTIVE_WL")"
 
-  local ACTIVE_JOBS=0
+  local START_INDEX
+  START_INDEX=$(state_get '.progress.ffuf.last_index')
+  [ -z "$START_INDEX" ] && START_INDEX=0
+  [ "$START_INDEX" -gt 0 ] && log "  → Resuming ffuf from host $START_INDEX/$MAX_HOSTS"
+  touch "$VULN/.in_progress"
+  CURRENT_TOTAL=$MAX_HOSTS
+
+  local ffuf_count=0
   while IFS= read -r host; do
+    (( ffuf_count++ ))
+    [ "$ffuf_count" -le "$START_INDEX" ] && continue   # اتفحص خلاص في محاولة سابقة
+
+    CURRENT_ITEM=$ffuf_count
     local safe
     safe=$(echo "$host" | sed 's|https\?://||; s|[/:?&=]|_|g')
 
-    log "  → ffuf: $host"
+    log "  → [$ffuf_count/$MAX_HOSTS] ffuf: $host"
 
     (
       timeout "$JOB_TIMEOUT" ffuf \
@@ -933,21 +1143,27 @@ run_ffuf() {
         2>/dev/null
     ) &
 
-    ACTIVE_JOBS=$((ACTIVE_JOBS + 1))
-
-    if [ "$ACTIVE_JOBS" -ge "$MAX_PARALLEL" ]; then
-      wait_jobs "$MAX_PARALLEL"
-      ACTIVE_JOBS=$(jobs -r 2>/dev/null | wc -l)
+    # نفس فكرة الـ batch barrier اللي في Phase 7: نستنى دفعة
+    # كاملة من MAX_PARALLEL تخلص وبعدين نسجل last_index دقيق.
+    if (( ffuf_count % MAX_PARALLEL == 0 )); then
+      wait
+      state_set '.progress.ffuf.last_index' "$ffuf_count"
     fi
 
   done < <(head -n "$MAX_HOSTS" "$SUBS/live.txt")
 
   wait
+  state_set '.progress.ffuf.last_index' "$ffuf_count"
+  rm -f "$VULN/.in_progress"   # المرحلة خلصت بنجاح بالكامل
 
   local FFUF_FILES
   FFUF_FILES=$(ls "$VULN"/ffuf_*.json 2>/dev/null | wc -l)
   ok "FFUF done — $FFUF_FILES result files in $VULN/"
 
+  # بننشئ الملف دايمًا (حتى لو فاضي) عشان يبقى مؤشر recovery
+  # موثوق — لو مفيش نتايج، الملف بيتعمل فاضي بس موجود، فمرة
+  # جاية السكريبت مش هيعتبر المرحلة "لسه محتاجة تتعمل".
+  : > "$VULN/ffuf_all_found.txt"
   if [ "$FFUF_FILES" -gt 0 ]; then
     for f in "$VULN"/ffuf_*.json; do
       grep -oP '"url"\s*:\s*"\K[^"]+' "$f" 2>/dev/null
@@ -1097,22 +1313,49 @@ report() {
 #  MAIN
 # ===========================
 main() {
+  # لو المستخدم عمل Ctrl+C:
+  #  1. نقفل أي background jobs لسه شغالة (عشان ما تفضلش processes معلقة)
+  #  2. نطبعله تفاصيل واضحة: كام phase خلص، هو واقف فين بالظبط،
+  #     وعلى أي عنصر بالظبط لو كان جوه phase فيها loop (JS/ffuf)
+  #  3. نفك الـ lock عشان يقدر يشغل السكريبت تاني من غير ما يتقفل
+  trap '
+    echo -e "\n${YELLOW}${BOLD}[!] Interrupted — saving checkpoint...${NC}"
+    jobs -p | xargs -r kill 2>/dev/null
+    echo -e "${YELLOW}  Phases completed : $TOTAL_PHASES_DONE/$TOTAL_PHASES"
+    echo -e "  Current phase    : ${CURRENT_PHASE_NAME:-N/A}"
+    if [ "${CURRENT_TOTAL:-0}" -gt 0 ] 2>/dev/null; then
+      echo -e "  Current item     : $CURRENT_ITEM / $CURRENT_TOTAL"
+    fi
+    echo -e "${NC}\n${GREEN}Checkpoint saved successfully.${NC}\nRun the exact same command again to resume.\n"
+    release_lock
+    exit 130
+  ' INT
+
+  # لو السكريبت اتقفل بأي طريقة تانية (error، kill عادي، إلخ)
+  # برضو نفك الـ lock عشان تشغيلة جديدة متتقفلش من غير داعي
+  trap 'release_lock' EXIT
+
   banner
+  ensure_jq
   install_dependencies
   detect_wordlists
   setup_dirs
-  enum_subdomains
-  scan_ports
-  probe_hosts
-  collect_urls
-  analyze_js
-  filter_urls
-  gf_patterns
-  run_nuclei
-  run_ffuf
-  run_xss
+
+  run_phase "subdomains" enum_subdomains
+  run_phase "ports"      scan_ports
+  run_phase "probe"      probe_hosts
+  run_phase "urls"       collect_urls
+  run_phase "js"         analyze_js
+  run_phase "filter"     filter_urls
+  run_phase "gf"         gf_patterns
+  run_phase "nuclei"     run_nuclei
+  run_phase "ffuf"       run_ffuf
+  run_phase "xss"        run_xss
+
   report
-  echo -e "\n${GREEN}${BOLD}[✔] Spider-Recon v2.5 done! Output: $OUT${NC}"
+  rm -f "$STATE_FILE"   # خلص كل حاجة بنجاح → مرة جاية هتبقى scan جديد مش resume
+  release_lock
+  echo -e "\n${GREEN}${BOLD}[✔] Spider-Recon v2.9 done! Output: $OUT${NC}"
 }
 
 main
