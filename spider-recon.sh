@@ -19,6 +19,7 @@ START_TIME=$(date +%s)
 NUCLEI_UPDATE_PID=""
 DEEP_PROBE=false
 RUN_GOSPIDER=false
+RUN_AMASS=false
 
 # Timing tracking per phase
 declare -A PHASE_TIMES
@@ -50,12 +51,13 @@ Options:
   -l   Scope file (in-scope domains, one per line)
   -x   Deep mode (extra httpx ports, katana depth 3, nuclei low severity)
   -g   Also run gospider alongside katana (extra coverage, slower)
+  -a   Also run amass passive enum (slow, often redundant with subfinder -all)
   -h   Show this help
 
 Examples:
   $0 -d example.com
   $0 -d example.com -s -l scope.txt
-  $0 -d example.com -x -g       # full deep scan
+  $0 -d example.com -x -g -a    # full deep scan, everything on
 USAGE
 exit 1
 }
@@ -63,13 +65,14 @@ exit 1
 # ===========================
 #  ARGUMENTS
 # ===========================
-while getopts "d:l:sxgh" opt; do
+while getopts "d:l:sxgah" opt; do
   case $opt in
     d) DOMAIN=$OPTARG ;;
     l) SCOPE_FILE=$OPTARG ;;
     s) SLOW=true ;;
     x) DEEP_PROBE=true ;;
     g) RUN_GOSPIDER=true ;;
+    a) RUN_AMASS=true ;;
     h) usage ;;
     *) usage ;;
   esac
@@ -109,7 +112,11 @@ fi
 #  HELPERS
 # ===========================
 count_lines() {
-  [ -f "$1" ] && grep -c "" "$1" 2>/dev/null || echo 0
+  if [ -f "$1" ]; then
+    wc -l < "$1" 2>/dev/null | tr -d ' '
+  else
+    echo 0
+  fi
 }
 
 # portable wait: استنى لحد ما عدد background jobs يقل عن MAX
@@ -341,13 +348,18 @@ enum_subdomains() {
   ) &
   local PID_CRT=$!
 
-  if [ "$SLOW" = false ]; then
-    ( timeout 240 amass enum -passive -d "$DOMAIN" -timeout 3 -silent \
+  if [ "$RUN_AMASS" = true ]; then
+    # amass ابطأ أداة في المجموعة دي بطبيعته (بيستخدم عدد كبير من
+    # الـ data sources). بنديله وقت أكبر من الـ per-source timeout
+    # اللي بنطلبه منه (-timeout 5) عشان الـ wrapper مايقفلوش قسرًا
+    # قبل ما يخلص بشكل نضيف.
+    log "  → amass enabled (-a): this can take several minutes, be patient"
+    ( timeout 420 amass enum -passive -d "$DOMAIN" -timeout 5 -silent \
         2>/dev/null > "$SUBS/amass.txt" \
-        || { warn "amass timed out"; touch "$SUBS/amass.txt"; } ) &
+        || { warn "amass timed out after 7min — results so far still used"; } ) &
     local PID_AMASS=$!
   else
-    warn "  → amass skipped in slow mode"
+    log "  → amass skipped (subfinder -all already covers most passive sources; use -a to enable)"
     touch "$SUBS/amass.txt"
     local PID_AMASS=""
   fi
@@ -428,6 +440,17 @@ scan_ports() {
     -o "$PORTS/naabu.txt" 2>/dev/null || true
 
   ok "Open ports: $(count_lines "$PORTS/naabu.txt") entries"
+
+  # -------------------------------------------------------
+  # COOLDOWN: naabu SYN scan بمعدل عالي بيخلي مزودات CDN
+  # زي Cloudflare تعمل temporary rate-limit/block للـ IP
+  # بتاعنا. لو httpx اشتغل فورًا بعده على نفس الـ IPs هيرجع
+  # صفر نتايج مش لأن فيه مشكلة، لكن لأنه لسه محظور مؤقتًا.
+  # بنستنى شوية قبل ما ندخل على probe_hosts.
+  # -------------------------------------------------------
+  log "  → Cooldown 30s (يسمح لأي rate-limit مؤقت من CDN يزول قبل httpx)..."
+  sleep 30
+
   phase_end "2"
 }
 
@@ -482,6 +505,38 @@ probe_hosts() {
 
   local LIVE_COUNT
   LIVE_COUNT=$(count_lines "$SUBS/live.txt")
+
+  # -------------------------------------------------------
+  # RETRY: لو رجع صفر رغم وجود resolved hosts، الاحتمال الأقوى
+  # إن CDN (Cloudflare) لسه حاطط rate-limit مؤقت بسبب naabu.
+  # بنستنى فترة أطول (90s) وبنعيد المحاولة مرة واحدة قبل
+  # ما نستسلم ونكمل باقي الـ phases فاضية.
+  # -------------------------------------------------------
+  if [ "$LIVE_COUNT" -eq 0 ]; then
+    warn "Zero live hosts — likely still rate-limited by target's CDN after naabu. Retrying in 90s..."
+    sleep 90
+    httpx \
+      -l "$SUBS/resolved_hosts.txt" \
+      "${PORT_ARGS[@]}" \
+      -threads "$THREADS" \
+      -rate-limit "$RATE_LIMIT" \
+      -timeout 10 \
+      -retries 2 \
+      -silent \
+      -title \
+      -status-code \
+      -tech-detect \
+      -cdn \
+      -follow-redirects \
+      -o "$SUBS/live_detailed.txt" \
+      2>>"$SUBS/httpx_errors.txt"
+
+    awk '{print $1}' "$SUBS/live_detailed.txt" \
+      | grep -E "^https?://" \
+      | sort -u > "$SUBS/live.txt"
+    LIVE_COUNT=$(count_lines "$SUBS/live.txt")
+  fi
+
   ok "Live hosts: $LIVE_COUNT"
 
   # تحذير لو صفر
