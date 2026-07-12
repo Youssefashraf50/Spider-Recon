@@ -352,7 +352,7 @@ install_dependencies() {
   check_tool katana      "go install github.com/projectdiscovery/katana/cmd/katana@latest"
   check_tool gospider    "go install github.com/jaeles-project/gospider@latest"
   check_tool nuclei      "go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest"
-  check_tool ffuf         "go install github.com/ffuf/ffuf/v2@v2.1.0" "go install github.com/ffuf/ffuf/v2@latest"
+  check_tool ffuf        "go install github.com/ffuf/ffuf/v2@v2.1.0"
   check_tool dalfox      "go install github.com/hahwul/dalfox/v2@latest"
   check_tool gf          "go install github.com/tomnomnom/gf@latest"
   check_tool qsreplace   "go install github.com/tomnomnom/qsreplace@latest"
