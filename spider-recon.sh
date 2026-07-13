@@ -1127,21 +1127,22 @@ run_ffuf() {
 
     log "  → [$ffuf_count/$MAX_HOSTS] ffuf: $host"
 
-    (
-      timeout "$JOB_TIMEOUT" ffuf \
-        -u "${host}/FUZZ" \
-        -w "$ACTIVE_WL" \
-        -mc 200,204,301,302,307,401,403,405 \
-        -t "$FFUF_THREADS" \
-        -rate "$FFUF_RATE" \
-        -maxtime-job "$((JOB_TIMEOUT - 10))" \
-        -ac \
-        -p 0.1 \
-        -of json \
-        -o "$VULN/ffuf_${safe}.json" \
-        -s \
-        2>/dev/null
-    ) &
+   (
+  ffuf \
+    -u "${host}/FUZZ" \
+    -w "$ACTIVE_WL" \
+    -mc 200,204,301,302,307,401,403,405 \
+    -t "$FFUF_THREADS" \
+    -rate "$FFUF_RATE" \
+    -maxtime "$JOB_TIMEOUT" \
+    -maxtime-job "$JOB_TIMEOUT" \
+    -ac \
+    -p 0.1 \
+    -of json \
+    -o "$VULN/ffuf_${safe}.json" \
+    -s \
+    2>/dev/null
+) &
 
     # نفس فكرة الـ batch barrier اللي في Phase 7: نستنى دفعة
     # كاملة من MAX_PARALLEL تخلص وبعدين نسجل last_index دقيق.
