@@ -159,7 +159,8 @@ init_state() {
 
   if [ "$RESET" = true ]; then
     warn "Reset (-r) requested — clearing saved state, starting fresh."
-    rm -f "$STATE_FILE" "$JS/.in_progress" "$VULN/.in_progress"
+    rm -f "$STATE_FILE" "$JS/.in_progress" "$VULN/.in_progress" \
+          "$PORTS/naabu.txt.inprogress" "$SUBS/live_detailed.txt.inprogress"
   fi
 
   if [ ! -f "$STATE_FILE" ]; then
@@ -227,8 +228,8 @@ is_phase_done() {
   fi
   case "$phase" in
     subdomains) [ -s "$SUBS/resolved_hosts.txt" ] ;;
-    ports)      [ -f "$PORTS/naabu.txt" ] ;;
-    probe)      [ -s "$SUBS/live_detailed.txt" ] ;;
+    ports)      [ -f "$PORTS/naabu.txt" ] && [ ! -f "$PORTS/naabu.txt.inprogress" ] ;;
+    probe)      [ -s "$SUBS/live_detailed.txt" ] && [ ! -f "$SUBS/live_detailed.txt.inprogress" ] ;;
     urls)       [ -s "$URLS/all_urls.txt" ] ;;
     js)         [ -f "$JS/js_urls.txt" ] && [ ! -f "$JS/.in_progress" ] ;;
     filter)     [ -f "$URLS/params_urls.txt" ] ;;
@@ -287,6 +288,58 @@ wait_jobs() {
       sleep 0.3
     done
   fi
+}
+
+# ===========================
+#  CHUNKED SCAN (resume على مستوى العنصر لأدوات زي naabu/httpx)
+# ===========================
+# بتقسم ملف hosts كبير لـ chunks صغيرة، وبتشغل $cmd_func على كل
+# chunk لوحده، وبتسجل آخر chunk خلص في state.json. لو السكريبت
+# اتقطع في نص فحص target كبير (100+ host)، بيكمل من آخر chunk
+# بدل ما يعيد الـ list كله من الأول.
+run_chunked_scan() {
+  local state_key="$1" input_file="$2" chunk_size="$3" out_file="$4" cmd_func="$5"
+  local inprogress_marker="${out_file}.inprogress"
+
+  local total_lines
+  total_lines=$(count_lines "$input_file")
+  if [ "$total_lines" -eq 0 ]; then
+    touch "$out_file"
+    return 0
+  fi
+
+  local total_chunks=$(( (total_lines + chunk_size - 1) / chunk_size ))
+  local start_chunk
+  start_chunk=$(state_get ".progress.${state_key}.last_chunk")
+  [ -z "$start_chunk" ] && start_chunk=0
+
+  if [ "$start_chunk" -eq 0 ]; then
+    : > "$out_file"
+  else
+    log "  → Resuming $state_key from chunk $start_chunk/$total_chunks"
+  fi
+  # علامة "لسه شغال" — بتتشال بس لما كل الـ chunks تخلص بنجاح.
+  # لو الـ state.json اتحذف بالغلط وسط الشغل، وجود العلامة دي
+  # بيمنع is_phase_done() إنها تعتبر المرحلة خلصت غلط.
+  touch "$inprogress_marker"
+
+  local tmp_dir
+  tmp_dir=$(mktemp -d)
+  split -l "$chunk_size" "$input_file" "$tmp_dir/${state_key}_chunk_"
+
+  CURRENT_TOTAL=$total_chunks
+  local chunk_num=0
+  for chunk_file in "$tmp_dir/${state_key}_chunk_"*; do
+    chunk_num=$((chunk_num + 1))
+    if [ "$chunk_num" -le "$start_chunk" ]; then continue; fi
+    CURRENT_ITEM=$chunk_num
+    log "  → [$state_key] chunk $chunk_num/$total_chunks ($(count_lines "$chunk_file") hosts)"
+    "$cmd_func" "$chunk_file" "$out_file"
+    state_set ".progress.${state_key}.last_chunk" "$chunk_num"
+  done
+
+  rm -rf "$tmp_dir"
+  rm -f "$inprogress_marker"
 }
 
 phase_start() {
@@ -352,7 +405,7 @@ install_dependencies() {
   check_tool katana      "go install github.com/projectdiscovery/katana/cmd/katana@latest"
   check_tool gospider    "go install github.com/jaeles-project/gospider@latest"
   check_tool nuclei      "go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest"
-  check_tool ffuf        "go install github.com/ffuf/ffuf/v2@v2.1.0"
+  check_tool ffuf         "go install github.com/ffuf/ffuf/v2@v2.1.0" "go install github.com/ffuf/ffuf/v2@latest"
   check_tool dalfox      "go install github.com/hahwul/dalfox/v2@latest"
   check_tool gf          "go install github.com/tomnomnom/gf@latest"
   check_tool qsreplace   "go install github.com/tomnomnom/qsreplace@latest"
@@ -601,14 +654,15 @@ scan_ports() {
     return
   fi
 
-  # top-100 ports بدل 1000 — أسرع بكثير
-  naabu \
-    -l "$SUBS/resolved_hosts.txt" \
-    -top-ports 100 \
-    -silent \
-    -rate "$RATE_LIMIT" \
-    -timeout 5 \
-    -o "$PORTS/naabu.txt" 2>/dev/null || true
+  # تقسيم الـ hosts لـ chunks (50 لكل chunk) عشان لو اتقطعت في
+  # نص الفحص (target كبير زي hubspot بـ 100+ host)، تكمل من آخر
+  # chunk بدل ما تعيد كل الـ list من الأول.
+  naabu_chunk_cmd() {
+    local chunk_file="$1" out_file="$2"
+    naabu -l "$chunk_file" -top-ports 100 -silent -rate "$RATE_LIMIT" -timeout 5 \
+      2>/dev/null >> "$out_file" || true
+  }
+  run_chunked_scan "naabu" "$SUBS/resolved_hosts.txt" 50 "$PORTS/naabu.txt" naabu_chunk_cmd
 
   ok "Open ports: $(count_lines "$PORTS/naabu.txt") entries"
 
@@ -653,21 +707,27 @@ probe_hosts() {
     log "  → Fast probe: checking 80,443 only (use -x for extra ports)"
   fi
 
-  httpx \
-    -l "$SUBS/resolved_hosts.txt" \
-    "${PORT_ARGS[@]}" \
-    -threads "$THREADS" \
-    -rate-limit "$RATE_LIMIT" \
-    -timeout 10 \
-    -retries 2 \
-    -silent \
-    -title \
-    -status-code \
-    -tech-detect \
-    -cdn \
-    -follow-redirects \
-    -o "$SUBS/live_detailed.txt" \
-    2>"$SUBS/httpx_errors.txt"
+  httpx_chunk_cmd() {
+    local chunk_file="$1" out_file="$2"
+    httpx \
+      -l "$chunk_file" \
+      "${PORT_ARGS[@]}" \
+      -threads "$THREADS" \
+      -rate-limit "$RATE_LIMIT" \
+      -timeout 10 \
+      -retries 2 \
+      -silent \
+      -title \
+      -status-code \
+      -tech-detect \
+      -cdn \
+      -follow-redirects \
+      2>>"$SUBS/httpx_errors.txt" >> "$out_file"
+  }
+
+  # chunks صغيرة (30 host) عشان لو اتقطعت في نص الفحص تكمل من
+  # آخر chunk بدل ما تعيد كل الـ list من الأول
+  run_chunked_scan "httpx" "$SUBS/resolved_hosts.txt" 30 "$SUBS/live_detailed.txt" httpx_chunk_cmd
 
   # استخرج URLs فقط (العمود الأول)
   awk '{print $1}' "$SUBS/live_detailed.txt" \
@@ -680,27 +740,14 @@ probe_hosts() {
   # -------------------------------------------------------
   # RETRY: لو رجع صفر رغم وجود resolved hosts، الاحتمال الأقوى
   # إن CDN (Cloudflare) لسه حاطط rate-limit مؤقت بسبب naabu.
-  # بنستنى فترة أطول (90s) وبنعيد المحاولة مرة واحدة قبل
-  # ما نستسلم ونكمل باقي الـ phases فاضية.
+  # بنستنى فترة أطول (90s) وبنعيد كل الـ chunks تاني (بنصفر
+  # last_chunk في الـ state) قبل ما نستسلم.
   # -------------------------------------------------------
   if [ "$LIVE_COUNT" -eq 0 ]; then
     warn "Zero live hosts — likely still rate-limited by target's CDN after naabu. Retrying in 90s..."
     sleep 90
-    httpx \
-      -l "$SUBS/resolved_hosts.txt" \
-      "${PORT_ARGS[@]}" \
-      -threads "$THREADS" \
-      -rate-limit "$RATE_LIMIT" \
-      -timeout 10 \
-      -retries 2 \
-      -silent \
-      -title \
-      -status-code \
-      -tech-detect \
-      -cdn \
-      -follow-redirects \
-      -o "$SUBS/live_detailed.txt" \
-      2>>"$SUBS/httpx_errors.txt"
+    state_set '.progress.httpx.last_chunk' 0
+    run_chunked_scan "httpx" "$SUBS/resolved_hosts.txt" 30 "$SUBS/live_detailed.txt" httpx_chunk_cmd
 
     awk '{print $1}' "$SUBS/live_detailed.txt" \
       | grep -E "^https?://" \
@@ -1127,22 +1174,27 @@ run_ffuf() {
 
     log "  → [$ffuf_count/$MAX_HOSTS] ffuf: $host"
 
-   (
-  ffuf \
-    -u "${host}/FUZZ" \
-    -w "$ACTIVE_WL" \
-    -mc 200,204,301,302,307,401,403,405 \
-    -t "$FFUF_THREADS" \
-    -rate "$FFUF_RATE" \
-    -maxtime "$JOB_TIMEOUT" \
-    -maxtime-job "$JOB_TIMEOUT" \
-    -ac \
-    -p 0.1 \
-    -of json \
-    -o "$VULN/ffuf_${safe}.json" \
-    -s \
-    2>/dev/null
-) &
+    (
+      # اعتمدنا على -maxtime-job الداخلية بتاعة ffuf بس (بدل
+      # ما نلفها كمان بـ timeout خارجي). الـ timeout الخارجي كان
+      # بيقدر يقفل ffuf بالقوة (SIGTERM) في نص كتابة ملف الـ JSON
+      # لو الاتنين اتصادفوا في نفس اللحظة تقريبًا، وده كان بيسيب
+      # ملفات ffuf_*.json تالفة/ناقصة أحيانًا. -maxtime-job وحدها
+      # كافية لأنها built-in وبتقفل الأداة بشكل نظيف من جوه.
+      ffuf \
+        -u "${host}/FUZZ" \
+        -w "$ACTIVE_WL" \
+        -mc 200,204,301,302,307,401,403,405 \
+        -t "$FFUF_THREADS" \
+        -rate "$FFUF_RATE" \
+        -maxtime-job "$JOB_TIMEOUT" \
+        -ac \
+        -p 0.1 \
+        -of json \
+        -o "$VULN/ffuf_${safe}.json" \
+        -s \
+        2>/dev/null
+    ) &
 
     # نفس فكرة الـ batch barrier اللي في Phase 7: نستنى دفعة
     # كاملة من MAX_PARALLEL تخلص وبعدين نسجل last_index دقيق.
@@ -1202,11 +1254,52 @@ run_xss() {
   fi
   ok "After dedup: $(count_lines "$VULN/xss_dedup.txt") URLs"
 
+  # Gxss عداة قديمة نسبيًا ومش بتتصون بنشاط، وعلى targets كبيرة
+  # (زي hubspot) بتاخد وقت طويل أو تعلق. بما إن dalfox أصلاً
+  # بيعمل reflection check جوه شغله، مفيش داعي نصر على Gxss لو
+  # عدد الـ URLs كبير جدًا — نسيب الشغلانة كاملة لـ dalfox.
+  local GXSS_SKIP_THRESHOLD=5000
+
   if command -v Gxss &>/dev/null && [ -s "$VULN/xss_dedup.txt" ]; then
-    log "  → Running Gxss (reflection check)..."
-    cat "$VULN/xss_dedup.txt" \
-      | Gxss -c 50 2>/dev/null \
-      | sort -u > "$VULN/xss_reflected.txt"
+    local XSS_TOTAL
+    XSS_TOTAL=$(count_lines "$VULN/xss_dedup.txt")
+
+    if [ "$XSS_TOTAL" -gt "$GXSS_SKIP_THRESHOLD" ]; then
+      warn "Gxss skipped: $XSS_TOTAL URLs > $GXSS_SKIP_THRESHOLD (Gxss is slow/unmaintained at this scale)."
+      warn "  dalfox will do its own reflection check instead — see run_dalfox.sh"
+      cp "$VULN/xss_dedup.txt" "$VULN/xss_reflected.txt"
+    else
+      log "  → Running Gxss (reflection check) in batches..."
+      local GXSS_BATCH=500
+      local total_chunks=$(( (XSS_TOTAL + GXSS_BATCH - 1) / GXSS_BATCH ))
+      local start_chunk
+      start_chunk=$(state_get '.progress.gxss.last_chunk')
+      [ -z "$start_chunk" ] && start_chunk=0
+
+      if [ "$start_chunk" -eq 0 ]; then
+        : > "$VULN/xss_reflected.txt"
+      else
+        log "  → Resuming Gxss from batch $start_chunk/$total_chunks"
+      fi
+
+      local tmp_dir
+      tmp_dir=$(mktemp -d)
+      split -l "$GXSS_BATCH" "$VULN/xss_dedup.txt" "$tmp_dir/gxss_chunk_"
+
+      local chunk_num=0
+      for chunk_file in "$tmp_dir"/gxss_chunk_*; do
+        chunk_num=$((chunk_num + 1))
+        [ "$chunk_num" -le "$start_chunk" ] && continue
+        CURRENT_ITEM=$chunk_num
+        CURRENT_TOTAL=$total_chunks
+        printf "\r  → Gxss batch %d/%d" "$chunk_num" "$total_chunks"
+        cat "$chunk_file" | timeout 120 Gxss -c 50 2>/dev/null >> "$VULN/xss_reflected.txt"
+        state_set '.progress.gxss.last_chunk' "$chunk_num"
+      done
+      echo ""
+      rm -rf "$tmp_dir"
+      sort -u -o "$VULN/xss_reflected.txt" "$VULN/xss_reflected.txt"
+    fi
     ok "Gxss reflected URLs: $(count_lines "$VULN/xss_reflected.txt")"
   else
     cp "$VULN/xss_dedup.txt" "$VULN/xss_reflected.txt" 2>/dev/null || true
