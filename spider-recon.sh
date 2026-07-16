@@ -56,12 +56,15 @@ Usage: $0 -d domain.com [options]
 Options:
   -d   Target domain (required)
   -s   Slow mode (lower threads/rate, stealthier)
-  -l   Scope file (in-scope domains, one per line)
+  -l   Scope file (in-scope domains, one per line) — skips the interactive prompt
   -x   Deep mode (extra httpx ports, katana depth 3, nuclei low severity)
   -g   Also run gospider alongside katana (extra coverage, slower)
   -a   Also run amass passive enum (slow, often redundant with subfinder -all)
   -r   Reset — ignore any saved checkpoint and start fully from scratch
   -h   Show this help
+
+Note: if -l isn't given, the script will ask interactively whether you
+have a scope list and let you type it in before starting.
 
 Examples:
   $0 -d example.com
@@ -91,6 +94,39 @@ while getopts "d:l:sxgarh" opt; do
 done
 
 [ -z "$DOMAIN" ] && usage
+
+# ===========================
+#  INTERACTIVE SCOPE INPUT
+# ===========================
+# لو مديتش -l scope.txt من الأول، السكريبت بيسألك مباشرة:
+# عندك scope list ولا لأ. لو "y"، تكتب النطاقات المسموحة سطر
+# سطر وينزل Enter فاضي لما تخلص. لو "n" أو Enter فاضي على طول،
+# السكريبت بيكمل عادي من غير فلترة scope.
+if [ -z "$SCOPE_FILE" ]; then
+  read -rp "$(echo -e "${CYAN}[?]${NC} Do you have a scope list for ${BOLD}$DOMAIN${NC}? (y/n): ")" HAS_SCOPE
+  if [[ "$HAS_SCOPE" =~ ^[Yy] ]]; then
+    mkdir -p "output/$DOMAIN"
+    SCOPE_FILE="output/$DOMAIN/scope.txt"
+    echo -e "${CYAN}Enter in-scope domains/patterns, one per line (e.g. api.$DOMAIN, .$DOMAIN).${NC}"
+    echo -e "${CYAN}Press ENTER on an empty line when you're done:${NC}"
+    : > "$SCOPE_FILE"
+    while true; do
+      read -rp "  > " scope_entry
+      [ -z "$scope_entry" ] && break
+      echo "$scope_entry" >> "$SCOPE_FILE"
+    done
+    SCOPE_COUNT=$(grep -c "" "$SCOPE_FILE" 2>/dev/null || echo 0)
+    if [ "$SCOPE_COUNT" -eq 0 ]; then
+      echo -e "${YELLOW}[!]${NC} No scope entries entered — continuing without scope filtering."
+      rm -f "$SCOPE_FILE"
+      SCOPE_FILE=""
+    else
+      echo -e "${GREEN}[+]${NC} Scope saved: $SCOPE_COUNT entries → $SCOPE_FILE"
+    fi
+  else
+    echo -e "${CYAN}[i]${NC} No scope list — continuing without filtering (all discovered subdomains used)."
+  fi
+fi
 
 # ===========================
 #  THREAD / RATE CONTROL
@@ -1268,6 +1304,7 @@ run_xss() {
       warn "Gxss skipped: $XSS_TOTAL URLs > $GXSS_SKIP_THRESHOLD (Gxss is slow/unmaintained at this scale)."
       warn "  dalfox will do its own reflection check instead — see run_dalfox.sh"
       cp "$VULN/xss_dedup.txt" "$VULN/xss_reflected.txt"
+      touch "$VULN/.gxss_skipped"   # عشان التقرير النهائي يوضح إن الرقم ده خام مش متحقق منه
     else
       log "  → Running Gxss (reflection check) in batches..."
       local GXSS_BATCH=500
@@ -1352,7 +1389,7 @@ report() {
 
   {
     echo "================================================"
-    echo "       SPIDER-RECON v2.5 — FINAL REPORT"
+    echo "       SPIDER-RECON v3.1 — FINAL REPORT"
     echo "================================================"
     echo "Target   : $DOMAIN"
     echo "Date     : $(date)"
