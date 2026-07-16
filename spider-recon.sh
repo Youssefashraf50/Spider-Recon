@@ -1486,7 +1486,7 @@ main() {
   report
   rm -f "$STATE_FILE"   # خلص كل حاجة بنجاح → مرة جاية هتبقى scan جديد مش resume
   release_lock
-  echo -e "\n${GREEN}${BOLD}[✔] Spider-Recon v2.9 done! Output: $OUT${NC}"
+  echo -e "\n${GREEN}${BOLD}[✔] Spider-Recon v2.4 done! Output: $OUT${NC}"
 }
 
 main
