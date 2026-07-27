@@ -1,7 +1,17 @@
 #!/bin/bash
 # ============================================================
-#  Spider-Recon v2.4  -  Bug Bounty Automation
+#  Spider-Recon v3.0  -  Bug Bounty Automation
 #  By: Youssef Ashraf
+# ============================================================
+#  v3.0 changes:
+#  - FFUF baseline check: filters soft-403 catch-all responses
+#  - JS secrets: value-level dedup so repeated keys aren't overcounted
+#  - Report: honesty labels — "UNVERIFIED PATTERN MATCHES" not "VULNERABILITY"
+#  - Gxss skip: annotated in report when skipped for large sets
+#  - Nuclei severity breakdown (critical/high/medium) in report
+#  - subjs per-host timeout instead of single global timeout
+#  - inprogress marker cleanup via trap for crash safety
+#  - State file kept on completion (manual delete needed for full reset)
 # ============================================================
 
 set -o pipefail
@@ -70,7 +80,7 @@ Examples:
   $0 -d example.com
   $0 -d example.com -s -l scope.txt
   $0 -d example.com -x -g -a    # full deep scan, everything on
-  $0 -d example.com             # run again with same domain → auto-resumes
+  $0 -d example.com             # run again with same domain -> auto-resumes
   $0 -d example.com -r          # force restart, ignore checkpoint
 USAGE
 exit 1
@@ -98,10 +108,6 @@ done
 # ===========================
 #  INTERACTIVE SCOPE INPUT
 # ===========================
-# لو مديتش -l scope.txt من الأول، السكريبت بيسألك مباشرة:
-# عندك scope list ولا لأ. لو "y"، تكتب النطاقات المسموحة سطر
-# سطر وينزل Enter فاضي لما تخلص. لو "n" أو Enter فاضي على طول،
-# السكريبت بيكمل عادي من غير فلترة scope.
 if [ -z "$SCOPE_FILE" ]; then
   read -rp "$(echo -e "${CYAN}[?]${NC} Do you have a scope list for ${BOLD}$DOMAIN${NC}? (y/n): ")" HAS_SCOPE
   if [[ "$HAS_SCOPE" =~ ^[Yy] ]]; then
@@ -121,10 +127,10 @@ if [ -z "$SCOPE_FILE" ]; then
       rm -f "$SCOPE_FILE"
       SCOPE_FILE=""
     else
-      echo -e "${GREEN}[+]${NC} Scope saved: $SCOPE_COUNT entries → $SCOPE_FILE"
+      echo -e "${GREEN}[+]${NC} Scope saved: $SCOPE_COUNT entries -> $SCOPE_FILE"
     fi
   else
-    echo -e "${CYAN}[i]${NC} No scope list — continuing without filtering (all discovered subdomains used)."
+    echo -e "${CYAN}[i]${NC} No scope list — continuing without filtering."
   fi
 fi
 
@@ -170,12 +176,7 @@ count_lines() {
 # ===========================
 #  STATE FILE (checkpoint) / RESUME / LOCK
 # ===========================
-# كل حالة السكريبت (المراحل المخلصة + تقدم داخل المراحل الطويلة)
-# متخزنة في ملف JSON واحد: output/<domain>/.state.json
-# بدل ملفات متفرقة. بيحتوي على checkpoint_version عشان لو
-# اتغيرت طريقة الحفظ مستقبلاً، السكريبت يعرف يتعامل مع
-# state files قديمة بدل ما يكسر أو يقرأها غلط.
-CHECKPOINT_VERSION=1
+CHECKPOINT_VERSION=2
 
 ensure_jq() {
   if ! command -v jq &>/dev/null; then
@@ -200,7 +201,7 @@ init_state() {
   fi
 
   if [ ! -f "$STATE_FILE" ]; then
-    jq -n --argjson ver "$CHECKPOINT_VERSION" --arg sv "2.9" --arg d "$DOMAIN" --arg t "$(date -Iseconds)" \
+    jq -n --argjson ver "$CHECKPOINT_VERSION" --arg sv "3.0" --arg d "$DOMAIN" --arg t "$(date -Iseconds)" \
       '{checkpoint_version:$ver, script_version:$sv, domain:$d, completed_phases:[], progress:{}, started_at:$t, updated_at:$t}' \
       > "$STATE_FILE"
     return
@@ -211,7 +212,7 @@ init_state() {
   if [ "$ver" != "$CHECKPOINT_VERSION" ]; then
     warn "State file format is old/incompatible (v$ver) — starting fresh (old file kept as .bak)."
     cp "$STATE_FILE" "${STATE_FILE}.v${ver}.bak" 2>/dev/null
-    jq -n --argjson ver "$CHECKPOINT_VERSION" --arg sv "2.9" --arg d "$DOMAIN" --arg t "$(date -Iseconds)" \
+    jq -n --argjson ver "$CHECKPOINT_VERSION" --arg sv "3.0" --arg d "$DOMAIN" --arg t "$(date -Iseconds)" \
       '{checkpoint_version:$ver, script_version:$sv, domain:$d, completed_phases:[], progress:{}, started_at:$t, updated_at:$t}' \
       > "$STATE_FILE"
   else
@@ -220,7 +221,6 @@ init_state() {
   fi
 }
 
-# state_set '.progress.js.last_index' 80   ← الـ value لازم تبقى JSON صحيح
 state_set() {
   local jq_path="$1" jq_value="$2"
   local tmp
@@ -232,8 +232,6 @@ state_get() {
   jq -r "$1 // empty" "$STATE_FILE" 2>/dev/null
 }
 
-# lock بسيط عشان تشغيلتين للسكريبت على نفس الدومين في نفس
-# الوقت ميكتبوش على نفس الملفات مع بعض
 acquire_lock() {
   if [ -f "$LOCK_FILE" ]; then
     local old_pid
@@ -253,10 +251,6 @@ release_lock() {
   [ -n "$LOCK_FILE" ] && rm -f "$LOCK_FILE" 2>/dev/null
 }
 
-# is_phase_done: أول حاجة بيشوفها هي الـ state file نفسه.
-# لو مش لاقيها هناك (مثلاً الملف اتحذف بالغلط)، بيعمل "recovery"
-# عن طريق فحص لو ملف النتيجة الحقيقي بتاع المرحلة موجود وغير
-# فاضي — لو أيوه، يبقى المرحلة خلصت فعلاً ومفيش داعي تتعاد.
 is_phase_done() {
   local phase="$1"
   if jq -e --arg p "$phase" '.completed_phases | index($p) != null' "$STATE_FILE" >/dev/null 2>&1; then
@@ -293,18 +287,14 @@ run_phase() {
   CURRENT_PHASE_NAME="$name"
   if is_phase_done "$name"; then
     ok "⏭  [$TOTAL_PHASES_DONE/$TOTAL_PHASES] Skipping '$name' — already completed"
-    mark_phase_done "$name"   # يسجلها لو كانت مكتشفة بالـ recovery بس مش مسجلة في الـ state
+    mark_phase_done "$name"
     return
   fi
-  log "${BOLD}[$TOTAL_PHASES_DONE/$TOTAL_PHASES — $(( TOTAL_PHASES_DONE * 100 / TOTAL_PHASES ))%] Starting '$name'...${NC}"
+  log "${BOLD}[$TOTAL_PHASES_DONE/$TOTAL_PHASES] Starting '$name'...${NC}"
   "$@"
   mark_phase_done "$name"
 }
 
-# إدارة parallel jobs: بنستخدم "wait -n" (بتستنى أول job يخلص بس،
-# مش كلهم) لو bash بتاعنا بيدعمها (4.3+) — ده أسرع وأخف على
-# المعالج من الـ polling loop القديم، وبيقلل احتمالية إن jobs
-# تتعلق فاضية. لو bash قديمة، بيرجع للـ polling القديم كـ fallback.
 BASH_SUPPORTS_WAIT_N=false
 if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3) )); then
   BASH_SUPPORTS_WAIT_N=true
@@ -327,12 +317,8 @@ wait_jobs() {
 }
 
 # ===========================
-#  CHUNKED SCAN (resume على مستوى العنصر لأدوات زي naabu/httpx)
+#  CHUNKED SCAN (resume-safe)
 # ===========================
-# بتقسم ملف hosts كبير لـ chunks صغيرة، وبتشغل $cmd_func على كل
-# chunk لوحده، وبتسجل آخر chunk خلص في state.json. لو السكريبت
-# اتقطع في نص فحص target كبير (100+ host)، بيكمل من آخر chunk
-# بدل ما يعيد الـ list كله من الأول.
 run_chunked_scan() {
   local state_key="$1" input_file="$2" chunk_size="$3" out_file="$4" cmd_func="$5"
   local inprogress_marker="${out_file}.inprogress"
@@ -352,12 +338,11 @@ run_chunked_scan() {
   if [ "$start_chunk" -eq 0 ]; then
     : > "$out_file"
   else
-    log "  → Resuming $state_key from chunk $start_chunk/$total_chunks"
+    log "  -> Resuming $state_key from chunk $start_chunk/$total_chunks"
   fi
-  # علامة "لسه شغال" — بتتشال بس لما كل الـ chunks تخلص بنجاح.
-  # لو الـ state.json اتحذف بالغلط وسط الشغل، وجود العلامة دي
-  # بيمنع is_phase_done() إنها تعتبر المرحلة خلصت غلط.
   touch "$inprogress_marker"
+  # Cleanup marker on ANY exit path from this function (normal, error, signal)
+  trap 'rm -f "$inprogress_marker"' RETURN
 
   local tmp_dir
   tmp_dir=$(mktemp -d)
@@ -369,13 +354,12 @@ run_chunked_scan() {
     chunk_num=$((chunk_num + 1))
     if [ "$chunk_num" -le "$start_chunk" ]; then continue; fi
     CURRENT_ITEM=$chunk_num
-    log "  → [$state_key] chunk $chunk_num/$total_chunks ($(count_lines "$chunk_file") hosts)"
+    log "  -> [$state_key] chunk $chunk_num/$total_chunks ($(count_lines "$chunk_file") hosts)"
     "$cmd_func" "$chunk_file" "$out_file"
     state_set ".progress.${state_key}.last_chunk" "$chunk_num"
   done
 
   rm -rf "$tmp_dir"
-  rm -f "$inprogress_marker"
 }
 
 phase_start() {
@@ -391,7 +375,6 @@ phase_end() {
   log "  Phase $name finished in ${PHASE_TIMES["${name}_dur"]}s"
 }
 
-# فلتر الـ scope لو اتعمل -l
 in_scope() {
   local host="$1"
   if [ -z "$SCOPE_FILE" ] || [ ! -f "$SCOPE_FILE" ]; then
@@ -454,9 +437,7 @@ install_dependencies() {
   command -v arjun       &>/dev/null || pip install -q arjun 2>/dev/null
   command -v uro         &>/dev/null || pip install -q uro 2>/dev/null
 
-  # -------------------------------------------------------
-  # gf patterns — لازم تكون موجودة وإلا Phase 9 بتطلع صفر
-  # -------------------------------------------------------
+  # gf patterns
   local GF_DIR="$HOME/.config/gf"
   if [ ! -d "$GF_DIR" ] || [ -z "$(ls -A "$GF_DIR"/*.json 2>/dev/null)" ]; then
     warn "gf patterns missing — downloading..."
@@ -476,7 +457,7 @@ install_dependencies() {
     ok "gf patterns: $(ls "$GF_DIR"/*.json 2>/dev/null | wc -l) patterns"
   fi
 
-  # nuclei templates في الخلفية
+  # nuclei templates background update
   if command -v nuclei &>/dev/null; then
     nuclei -update-templates -silent &>/dev/null &
     NUCLEI_UPDATE_PID=$!
@@ -493,7 +474,6 @@ detect_wordlists() {
               "/usr/share/seclists" "/opt/SecLists" \
               "$HOME/SecLists"; do
     if [ -d "$base" ]; then
-      # نفضّل common.txt لأنه أسرع بكثير من raft-medium
       local candidates=(
         "$base/Discovery/Web-Content/common.txt"
         "$base/Discovery/Web-Content/raft-small-directories.txt"
@@ -509,7 +489,6 @@ detect_wordlists() {
     fi
   done
 
-  # fallback
   for fb in "/usr/share/wordlists/dirb/common.txt" \
             "/usr/share/wordlists/dirbuster/directory-list-2.3-small.txt"; do
     if [ -f "$fb" ]; then
@@ -533,7 +512,7 @@ cat << "EOF"
   \___ \| '_ \| |/ _` |/ _ \ '__|  |  _  // _ \/ __/ _ \| '_ \
   ____) | |_) | | (_| |  __/ |     | | \ \  __/ (_| (_) | | | |
  |_____/| .__/|_|\__,_|\___|_|     |_|  \_\___|\___\___/|_| |_|
-        | |              v2.4  -  Bug Bounty Edition
+        | |              v3.0  -  Bug Bounty Edition
         |_|              By: Youssef Ashraf
 EOF
   echo ""
@@ -568,13 +547,7 @@ enum_subdomains() {
   phase "Phase 1: Subdomain Enumeration"
   phase_start "1"
 
-  # -------------------------------------------------------
-  # PERFORMANCE FIX: الأربع مصادر دي مستقلين عن بعض تمامًا،
-  # فبدل ما نستناهم واحد واحد (180+90+135+240 = ~10 دقايق)
-  # بنشغلهم كلهم في الخلفية مع بعض ونستنى أبطأ واحد بس.
-  # ده لوحده بيقلل وقت المرحلة دي من ~10 دقايق لـ ~4 دقايق.
-  # -------------------------------------------------------
-  log "  → Launching subfinder + assetfinder + crt.sh + amass in parallel..."
+  log "  -> Launching subfinder + assetfinder + crt.sh + amass in parallel..."
 
   ( timeout 180 subfinder -d "$DOMAIN" -all -silent \
       -o "$SUBS/subfinder.txt" 2>/dev/null \
@@ -609,17 +582,13 @@ enum_subdomains() {
   local PID_CRT=$!
 
   if [ "$RUN_AMASS" = true ]; then
-    # amass ابطأ أداة في المجموعة دي بطبيعته (بيستخدم عدد كبير من
-    # الـ data sources). بنديله وقت أكبر من الـ per-source timeout
-    # اللي بنطلبه منه (-timeout 5) عشان الـ wrapper مايقفلوش قسرًا
-    # قبل ما يخلص بشكل نضيف.
-    log "  → amass enabled (-a): this can take several minutes, be patient"
+    log "  -> amass enabled (-a): this can take several minutes, be patient"
     ( timeout 420 amass enum -passive -d "$DOMAIN" -timeout 5 -silent \
         2>/dev/null > "$SUBS/amass.txt" \
-        || { warn "amass timed out after 7min — results so far still used"; } ) &
+        || { warn "amass timed out after 7min — partial results still used"; } ) &
     local PID_AMASS=$!
   else
-    log "  → amass skipped (subfinder -all already covers most passive sources; use -a to enable)"
+    log "  -> amass skipped (subfinder -all already covers most passive sources; use -a to enable)"
     touch "$SUBS/amass.txt"
     local PID_AMASS=""
   fi
@@ -628,13 +597,11 @@ enum_subdomains() {
 
   ok "subfinder: $(count_lines "$SUBS/subfinder.txt")  assetfinder: $(count_lines "$SUBS/assetfinder.txt")  crt.sh: $(count_lines "$SUBS/crtsh.txt")  amass: $(count_lines "$SUBS/amass.txt")"
 
-  # دمج + فلترة scope
   cat "$SUBS"/*.txt 2>/dev/null \
     | grep -E "(^|\.)${DOMAIN}$" \
     | sed 's/^\*\.//' \
     | sort -u > "$SUBS/all_raw.txt"
 
-  # تطبيق scope لو موجود
   if [ -n "$SCOPE_FILE" ] && [ -f "$SCOPE_FILE" ]; then
     while IFS= read -r sub; do
       in_scope "$sub" >> "$SUBS/all.txt"
@@ -647,8 +614,7 @@ enum_subdomains() {
 
   ok "Total unique subdomains: $(count_lines "$SUBS/all.txt")"
 
-  # DNSx resolution
-  log "  → DNSx resolution..."
+  log "  -> DNSx resolution..."
   if [ -s "$SUBS/all.txt" ]; then
     timeout 300 dnsx \
       -l "$SUBS/all.txt" \
@@ -658,7 +624,6 @@ enum_subdomains() {
       -resp \
       -o "$SUBS/resolved.txt" 2>/dev/null \
       || cp "$SUBS/all.txt" "$SUBS/resolved.txt"
-    # استخرج الأسماء فقط (بدون IP) من output dnsx
     awk '{print $1}' "$SUBS/resolved.txt" | sort -u > "$SUBS/resolved_hosts.txt"
   else
     warn "No subdomains to resolve"
@@ -690,9 +655,6 @@ scan_ports() {
     return
   fi
 
-  # تقسيم الـ hosts لـ chunks (50 لكل chunk) عشان لو اتقطعت في
-  # نص الفحص (target كبير زي hubspot بـ 100+ host)، تكمل من آخر
-  # chunk بدل ما تعيد كل الـ list من الأول.
   naabu_chunk_cmd() {
     local chunk_file="$1" out_file="$2"
     naabu -l "$chunk_file" -top-ports 100 -silent -rate "$RATE_LIMIT" -timeout 5 \
@@ -702,14 +664,7 @@ scan_ports() {
 
   ok "Open ports: $(count_lines "$PORTS/naabu.txt") entries"
 
-  # -------------------------------------------------------
-  # COOLDOWN: naabu SYN scan بمعدل عالي بيخلي مزودات CDN
-  # زي Cloudflare تعمل temporary rate-limit/block للـ IP
-  # بتاعنا. لو httpx اشتغل فورًا بعده على نفس الـ IPs هيرجع
-  # صفر نتايج مش لأن فيه مشكلة، لكن لأنه لسه محظور مؤقتًا.
-  # بنستنى شوية قبل ما ندخل على probe_hosts.
-  # -------------------------------------------------------
-  log "  → Cooldown 30s (يسمح لأي rate-limit مؤقت من CDN يزول قبل httpx)..."
+  log "  -> Cooldown 30s (allow any temporary CDN rate-limit to subside before httpx)..."
   sleep 30
 
   phase_end "2"
@@ -717,12 +672,6 @@ scan_ports() {
 
 # ===========================
 #  PHASE 3: PROBE LIVE HOSTS
-# ===========================
-# PERFORMANCE FIX: كنا بنحدد 7 ports صريحة (80,443,8080,8443,
-# 8000,8888,3000) لكل host، وده بيضاعف وقت الـ probing 7 مرات
-# حتى لو أغلب الـ hosts شغالة بس على 80/443.
-# دلوقتي: افتراضيًا بنسيب httpx يجرب 80/443 بس (سريع)،
-# ولو عايز فحص الـ ports الإضافية استخدم -x (deep probe).
 # ===========================
 probe_hosts() {
   phase "Phase 3: Probing Live Hosts"
@@ -737,10 +686,10 @@ probe_hosts() {
 
   local PORT_ARGS=()
   if [ "$DEEP_PROBE" = true ]; then
-    log "  → Deep probe: checking 80,443,8080,8443,8000,8888,3000"
+    log "  -> Deep probe: checking 80,443,8080,8443,8000,8888,3000"
     PORT_ARGS=(-ports "80,443,8080,8443,8000,8888,3000")
   else
-    log "  → Fast probe: checking 80,443 only (use -x for extra ports)"
+    log "  -> Fast probe: checking 80,443 only (use -x for extra ports)"
   fi
 
   httpx_chunk_cmd() {
@@ -761,11 +710,8 @@ probe_hosts() {
       2>>"$SUBS/httpx_errors.txt" >> "$out_file"
   }
 
-  # chunks صغيرة (30 host) عشان لو اتقطعت في نص الفحص تكمل من
-  # آخر chunk بدل ما تعيد كل الـ list من الأول
   run_chunked_scan "httpx" "$SUBS/resolved_hosts.txt" 30 "$SUBS/live_detailed.txt" httpx_chunk_cmd
 
-  # استخرج URLs فقط (العمود الأول)
   awk '{print $1}' "$SUBS/live_detailed.txt" \
     | grep -E "^https?://" \
     | sort -u > "$SUBS/live.txt"
@@ -773,12 +719,6 @@ probe_hosts() {
   local LIVE_COUNT
   LIVE_COUNT=$(count_lines "$SUBS/live.txt")
 
-  # -------------------------------------------------------
-  # RETRY: لو رجع صفر رغم وجود resolved hosts، الاحتمال الأقوى
-  # إن CDN (Cloudflare) لسه حاطط rate-limit مؤقت بسبب naabu.
-  # بنستنى فترة أطول (90s) وبنعيد كل الـ chunks تاني (بنصفر
-  # last_chunk في الـ state) قبل ما نستسلم.
-  # -------------------------------------------------------
   if [ "$LIVE_COUNT" -eq 0 ]; then
     warn "Zero live hosts — likely still rate-limited by target's CDN after naabu. Retrying in 90s..."
     sleep 90
@@ -793,7 +733,6 @@ probe_hosts() {
 
   ok "Live hosts: $LIVE_COUNT"
 
-  # تحذير لو صفر
   if [ "$LIVE_COUNT" -eq 0 ]; then
     warn "Zero live hosts detected!"
     warn "  Check: $SUBS/httpx_errors.txt"
@@ -831,14 +770,6 @@ collect_urls() {
   phase "Phase 5: Active Crawling (katana)"
   phase_start "5"
 
-  # -------------------------------------------------------
-  # PERFORMANCE FIX: كانت -d 3 (عمق 3) + katana + gospider
-  # شغالين على كل الـ live hosts، وده بيعمل تكرار مجهود لأن
-  # الأداتين بيعملوا نفس الشغل (crawling) تقريبًا.
-  # دلوقتي: katana بس بعمق 2 افتراضيًا (كافي لـ recon أولي)،
-  # وgospider بقى اختياري (-g) لو محتاج تغطية إضافية.
-  # لو عايز عمق أكبر استخدم -x (deep mode).
-  # -------------------------------------------------------
   local KATANA_DEPTH=2
   [ "$DEEP_PROBE" = true ] && KATANA_DEPTH=3
 
@@ -856,7 +787,7 @@ collect_urls() {
     ok "Katana URLs (depth $KATANA_DEPTH): $(count_lines "$URLS/katana.txt")"
 
     if [ "$RUN_GOSPIDER" = true ] && command -v gospider &>/dev/null; then
-      log "  → gospider (extra coverage, -g enabled)..."
+      log "  -> gospider (extra coverage, -g enabled)..."
       gospider \
         -S "$SUBS/live.txt" \
         -c 10 -d 2 \
@@ -870,7 +801,7 @@ collect_urls() {
     fi
   else
     touch "$URLS/katana.txt" "$URLS/gospider.txt"
-    warn "No live hosts to crawl"
+    warn "No live hosts to crawl — skipping katana/gospider."
   fi
 
   phase_end "5"
@@ -896,7 +827,6 @@ collect_urls() {
     warn "paramspider not found"
   fi
 
-  # دمج كل URLs
   cat "$URLS"/*.txt 2>/dev/null \
     | grep -E "^https?://" \
     | sort -u > "$URLS/all_urls.txt"
@@ -908,23 +838,19 @@ collect_urls() {
 # ===========================
 #  PHASE 7: JS ANALYSIS
 # ===========================
-# PERFORMANCE FIX: كان فيه loop بيعمل curl لكل ملف JS
-# بالتتابع (sequential) — على 200 ملف بـ timeout 10s ده ممكن
-# ياخد لحد 33 دقيقة. دلوقتي بنجيب الملفات بالتوازي (10 في
-# نفس الوقت) عن طريق background jobs محكومة بـ wait_jobs،
-# فالوقت بيقل من ~33 دقيقة لـ ~3-4 دقايق على نفس الـ 200 ملف.
-# ===========================
 analyze_js() {
   phase "Phase 7: JavaScript Analysis"
   phase_start "7"
 
+  # Collect JS URLs from URL corpus
   grep -iE "\.js(\?|$)" "$URLS/all_urls.txt" 2>/dev/null \
     | sort -u > "$JS/js_urls.txt"
 
+  # subjs: per-host timeout to prevent one slow host from stalling all
   if [ -s "$SUBS/live.txt" ] && command -v subjs &>/dev/null; then
-    cat "$SUBS/live.txt" \
-      | timeout 60 subjs 2>/dev/null \
-      | anew "$JS/js_urls.txt" >/dev/null || true
+    while IFS= read -r host; do
+      timeout 10 bash -c "echo '$host' | subjs" 2>/dev/null
+    done < "$SUBS/live.txt" | anew "$JS/js_urls.txt" >/dev/null || true
   fi
 
   ok "JS files found: $(count_lines "$JS/js_urls.txt")"
@@ -935,8 +861,6 @@ analyze_js() {
     [ "$TOTAL_JS" -gt 200 ] && TOTAL_JS=200
     CURRENT_TOTAL=$TOTAL_JS
 
-    # last_index في state.json = آخر عنصر اتأكدنا إنه خلص بالكامل
-    # (بعد ما دفعة كاملة من الـ parallel jobs تخلص وnستنى wait).
     local START_INDEX
     START_INDEX=$(state_get '.progress.js.last_index')
     [ -z "$START_INDEX" ] && START_INDEX=0
@@ -945,9 +869,12 @@ analyze_js() {
       : > "$JS/endpoints.txt"
       : > "$JS/secrets.txt"
     else
-      log "  → Resuming JS analysis from item $START_INDEX/$TOTAL_JS"
+      log "  -> Resuming JS analysis from item $START_INDEX/$TOTAL_JS"
     fi
+
+    # inprogress marker with crash-safe cleanup
     touch "$JS/.in_progress"
+    trap 'rm -f "$JS/.in_progress"' RETURN
 
     local JS_PARALLEL=10
     local SECRET_PATTERN='(api[_-]?key|apikey|secret[_-]?key|access[_-]?token|auth[_-]?token|bearer|aws[_-]?access|aws[_-]?secret|client[_-]?secret|password|passwd|private[_-]?key)["\s:=]+[A-Za-z0-9+/=_-]{10,}'
@@ -976,33 +903,40 @@ analyze_js() {
     while IFS= read -r jsurl; do
       (( count++ ))
       [ "$count" -gt 200 ] && break
-      [ "$count" -le "$START_INDEX" ] && continue   # اتعالج خلاص في محاولة سابقة
+      [ "$count" -le "$START_INDEX" ] && continue
 
       CURRENT_ITEM=$count
-      printf "\r  → JS fetch progress: %d/%d" "$count" "$TOTAL_JS"
+      printf "\r  -> JS fetch progress: %d/%d" "$count" "$TOTAL_JS"
       fetch_js_one "$jsurl" &
 
-      # كل JS_PARALLEL عنصر، نستنى الدفعة تخلص بالكامل (barrier)
-      # وبعدين نسجل last_index — ده بيضمن إن الرقم المسجل دقيق
-      # 100%، مش تخمين وسط شغل لسه جاري.
       if (( count % JS_PARALLEL == 0 )); then
         wait
         state_set '.progress.js.last_index' "$count"
       fi
     done < "$JS/js_urls.txt"
     wait
-    echo ""   # سطر جديد بعد الـ progress counter
+    echo ""
     state_set '.progress.js.last_index' "$count"
 
     [ -f "$JS/endpoints.txt" ] && sort -u -o "$JS/endpoints.txt" "$JS/endpoints.txt"
     [ -f "$JS/secrets.txt"   ] && sort -u -o "$JS/secrets.txt" "$JS/secrets.txt"
-    rm -f "$JS/.in_progress"   # المرحلة خلصت بنجاح بالكامل
 
-    local SECRET_COUNT
-    SECRET_COUNT=$(count_lines "$JS/secrets.txt")
-    if [ "$SECRET_COUNT" -gt 0 ]; then
-      warn "⚠ Possible secrets: $SECRET_COUNT — review $JS/secrets.txt"
+    # === VALUE-LEVEL DEDUP FOR SECRETS ===
+    # secrets.txt has lines like:   [JS] https://x.com/b.js  ->  API_KEY=abc123
+    # Line-level sort -u doesn't dedup the actual value across URLs.
+    # Extract just the value portion, dedup that.
+    if [ -s "$JS/secrets.txt" ]; then
+      grep -oP '->\s*\K.*' "$JS/secrets.txt" | sed 's/^ *//' | sort -u > "$JS/secrets_values.txt"
+      local RAW_COUNT UNIQUE_COUNT
+      RAW_COUNT=$(count_lines "$JS/secrets.txt")
+      UNIQUE_COUNT=$(count_lines "$JS/secrets_values.txt")
+      ok "JS secrets — raw matches: $RAW_COUNT, unique values: $UNIQUE_COUNT"
+      if [ "$UNIQUE_COUNT" -gt 0 ]; then
+        warn "⚠ Review $JS/secrets_values.txt for the actual unique secrets"
+      fi
     fi
+
+    rm -f "$JS/.in_progress"
   fi
 
   phase_end "7"
@@ -1015,16 +949,13 @@ filter_urls() {
   phase "Phase 8: URL Filtering"
   phase_start "8"
 
-  # URLs بامتدادات مهمة
   grep -iE "\.(php|asp|aspx|jsp|json|xml|do|action|cgi)(\?|$)" \
     "$URLS/all_urls.txt" 2>/dev/null \
     | sort -u > "$URLS/filtered.txt" || touch "$URLS/filtered.txt"
 
-  # URLs بـ parameters فعلية
   grep -E "\?[a-zA-Z0-9_]+=." "$URLS/all_urls.txt" 2>/dev/null \
     | sort -u > "$URLS/has_params.txt" || touch "$URLS/has_params.txt"
 
-  # dedup بـ qsreplace
   if command -v qsreplace &>/dev/null; then
     cat "$URLS/has_params.txt" \
       | qsreplace -a 2>/dev/null \
@@ -1047,7 +978,6 @@ gf_patterns() {
   local GF_DIR="$HOME/.config/gf"
   local PATTERNS=(xss sqli ssrf lfi rce idor redirect ssti)
 
-  # تأكد إن في URLs
   if [ ! -s "$URLS/all_urls.txt" ]; then
     warn "all_urls.txt is empty — skipping gf"
     for pat in "${PATTERNS[@]}"; do touch "$VULN/gf_$pat.txt"; done
@@ -1055,7 +985,6 @@ gf_patterns() {
     return
   fi
 
-  # تأكد من patterns
   if [ ! -d "$GF_DIR" ] || [ -z "$(ls -A "$GF_DIR"/*.json 2>/dev/null)" ]; then
     warn "gf patterns missing — run install step first"
     for pat in "${PATTERNS[@]}"; do touch "$VULN/gf_$pat.txt"; done
@@ -1082,7 +1011,7 @@ gf_patterns() {
 
   if [ "$TOTAL" -eq 0 ]; then
     warn "All gf = 0. Possible causes:"
-    warn "  1. URLs collected don't have parameters → check params_urls.txt"
+    warn "  1. URLs collected don't have parameters -> check params_urls.txt"
     warn "  2. gf patterns don't match your target's URL style"
     warn "  Manual: cat $URLS/all_urls.txt | grep '=' | head -5"
   fi
@@ -1092,11 +1021,6 @@ gf_patterns() {
 
 # ===========================
 #  PHASE 10: NUCLEI
-# ===========================
-# PERFORMANCE FIX: كان بيشغل severity من low لحد critical.
-# low بتجيب noise كتير (info disclosure ضعيف، إلخ) من غير
-# فايدة حقيقية في bug bounty. افتراضيًا بقى medium+ بس،
-# واستخدم -x لو عايز full severity range.
 # ===========================
 run_nuclei() {
   phase "Phase 10: Nuclei Scanning"
@@ -1109,16 +1033,14 @@ run_nuclei() {
     return
   fi
 
-  # انتظر template update
   if [ -n "$NUCLEI_UPDATE_PID" ] && kill -0 "$NUCLEI_UPDATE_PID" 2>/dev/null; then
-    log "  → Waiting for nuclei templates update (max 60s)..."
+    log "  -> Waiting for nuclei templates update (max 60s)..."
     timeout 60 bash -c "wait $NUCLEI_UPDATE_PID" 2>/dev/null || true
   fi
 
-  # تأكد من templates
   local TMPL_DIR="$HOME/nuclei-templates"
   if [ ! -d "$TMPL_DIR" ]; then
-    log "  → Downloading nuclei templates..."
+    log "  -> Downloading nuclei templates..."
     nuclei -update-templates -silent 2>/dev/null || true
   fi
 
@@ -1132,7 +1054,7 @@ run_nuclei() {
   local SEVERITY="medium,high,critical"
   [ "$DEEP_PROBE" = true ] && SEVERITY="low,medium,high,critical"
 
-  log "  → Running nuclei on $(count_lines "$SUBS/live.txt") targets (severity: $SEVERITY)..."
+  log "  -> Running nuclei on $(count_lines "$SUBS/live.txt") targets (severity: $SEVERITY)..."
 
   nuclei \
     -l "$SUBS/live.txt" \
@@ -1148,6 +1070,13 @@ run_nuclei() {
   local N_COUNT
   N_COUNT=$(count_lines "$VULN/nuclei.txt")
   ok "Nuclei findings: $N_COUNT"
+
+  # Severity breakdown for report
+  local N_CRIT=$(grep -cE '\[critical\]' "$VULN/nuclei.txt" 2>/dev/null || echo 0)
+  local N_HIGH=$(grep -cE '\[high\]' "$VULN/nuclei.txt" 2>/dev/null || echo 0)
+  local N_MED=$(grep -cE '\[medium\]' "$VULN/nuclei.txt" 2>/dev/null || echo 0)
+  ok "  Critical: $N_CRIT | High: $N_HIGH | Medium: $N_MED"
+  echo "$N_CRIT:$N_HIGH:$N_MED" > "$VULN/.nuclei_severity_counts"
 
   if [ "$N_COUNT" -eq 0 ]; then
     warn "Nuclei = 0. Debug:"
@@ -1177,7 +1106,6 @@ run_ffuf() {
     return
   fi
 
-  # اختر أسرع wordlist متاحة (common.txt مش raft-medium)
   local ACTIVE_WL="$WORDLIST"
   local WL_LINES
   WL_LINES=$(wc -l < "$WORDLIST" 2>/dev/null || echo 0)
@@ -1186,37 +1114,53 @@ run_ffuf() {
     FAST_WL=$(dirname "$WORDLIST")/common.txt
     if [ -f "$FAST_WL" ]; then
       ACTIVE_WL="$FAST_WL"
-      warn "Wordlist too large ($WL_LINES lines) → using common.txt for speed"
+      warn "Wordlist too large ($WL_LINES lines) -> using common.txt for speed"
     fi
   fi
 
-  log "  → ffuf: $MAX_HOSTS hosts, $MAX_PARALLEL parallel, $(basename "$ACTIVE_WL")"
+  log "  -> ffuf: $MAX_HOSTS hosts, $MAX_PARALLEL parallel, $(basename "$ACTIVE_WL")"
 
   local START_INDEX
   START_INDEX=$(state_get '.progress.ffuf.last_index')
   [ -z "$START_INDEX" ] && START_INDEX=0
-  [ "$START_INDEX" -gt 0 ] && log "  → Resuming ffuf from host $START_INDEX/$MAX_HOSTS"
-  touch "$VULN/.in_progress"
-  CURRENT_TOTAL=$MAX_HOSTS
+  [ "$START_INDEX" -gt 0 ] && log "  -> Resuming ffuf from host $START_INDEX/$MAX_HOSTS"
 
+  # inprogress marker with crash-safe cleanup
+  touch "$VULN/.in_progress"
+  trap 'rm -f "$VULN/.in_progress"' RETURN
+
+  CURRENT_TOTAL=$MAX_HOSTS
   local ffuf_count=0
   while IFS= read -r host; do
     (( ffuf_count++ ))
-    [ "$ffuf_count" -le "$START_INDEX" ] && continue   # اتفحص خلاص في محاولة سابقة
+    [ "$ffuf_count" -le "$START_INDEX" ] && continue
 
     CURRENT_ITEM=$ffuf_count
     local safe
     safe=$(echo "$host" | sed 's|https\?://||; s|[/:?&=]|_|g')
 
-    log "  → [$ffuf_count/$MAX_HOSTS] ffuf: $host"
+    log "  -> [$ffuf_count/$MAX_HOSTS] ffuf: $host"
 
+    # ============================================================
+    # BASELINE CHECK: قبل ffuf بنعمل طلب لعنوان مش موجود عشان نعرف
+    # إزاي الـ server بيرد على 404/403 حقيقي. بعدين بنصفي نتايج ffuf
+    # من أي hits نفس response size/code بتاعة الـ baseline — ده بيشيل
+    # soft-403 catch-all pages اللي بتظهر فجميع المسارات.
+    # ============================================================
     (
-      # اعتمدنا على -maxtime-job الداخلية بتاعة ffuf بس (بدل
-      # ما نلفها كمان بـ timeout خارجي). الـ timeout الخارجي كان
-      # بيقدر يقفل ffuf بالقوة (SIGTERM) في نص كتابة ملف الـ JSON
-      # لو الاتنين اتصادفوا في نفس اللحظة تقريبًا، وده كان بيسيب
-      # ملفات ffuf_*.json تالفة/ناقصة أحيانًا. -maxtime-job وحدها
-      # كافية لأنها built-in وبتقفل الأداة بشكل نظيف من جوه.
+      # Baseline request for soft-403 detection
+      local BASELINE_RAND="SPIDER_RECON_BASELINE_$(date +%s)_$$_${ffuf_count}"
+      local BASELINE_FILE
+      BASELINE_FILE=$(mktemp)
+      local BASELINE_CODE BASELINE_SIZE BASELINE_WORDS
+
+      BASELINE_CODE=$(timeout 10 curl -s -L -o "$BASELINE_FILE" -w "%{http_code}" "${host}/${BASELINE_RAND}" 2>/dev/null)
+      if [ -f "$BASELINE_FILE" ]; then
+        BASELINE_SIZE=$(wc -c < "$BASELINE_FILE" 2>/dev/null || echo 0)
+        BASELINE_WORDS=$(wc -w < "$BASELINE_FILE" 2>/dev/null || echo 0)
+      fi
+      rm -f "$BASELINE_FILE"
+
       ffuf \
         -u "${host}/FUZZ" \
         -w "$ACTIVE_WL" \
@@ -1230,10 +1174,21 @@ run_ffuf() {
         -o "$VULN/ffuf_${safe}.json" \
         -s \
         2>/dev/null
+
+      # Filter out baseline-matching responses from the JSON
+      if [ -f "$VULN/ffuf_${safe}.json" ] && [ "${BASELINE_CODE}" != "" ]; then
+        local FILTERED
+        FILTERED=$(mktemp)
+        jq --argjson bc "${BASELINE_CODE:-0}" --argjson bs "${BASELINE_SIZE:-0}" --argjson bw "${BASELINE_WORDS:-0}" '
+          .results |= map(select(
+            .status != $bc or
+            (.length != $bs and .words != $bw)
+          ))
+        ' "$VULN/ffuf_${safe}.json" > "$FILTERED" 2>/dev/null && mv "$FILTERED" "$VULN/ffuf_${safe}.json"
+        rm -f "$FILTERED"
+      fi
     ) &
 
-    # نفس فكرة الـ batch barrier اللي في Phase 7: نستنى دفعة
-    # كاملة من MAX_PARALLEL تخلص وبعدين نسجل last_index دقيق.
     if (( ffuf_count % MAX_PARALLEL == 0 )); then
       wait
       state_set '.progress.ffuf.last_index' "$ffuf_count"
@@ -1243,21 +1198,18 @@ run_ffuf() {
 
   wait
   state_set '.progress.ffuf.last_index' "$ffuf_count"
-  rm -f "$VULN/.in_progress"   # المرحلة خلصت بنجاح بالكامل
+  rm -f "$VULN/.in_progress"
 
   local FFUF_FILES
   FFUF_FILES=$(ls "$VULN"/ffuf_*.json 2>/dev/null | wc -l)
   ok "FFUF done — $FFUF_FILES result files in $VULN/"
 
-  # بننشئ الملف دايمًا (حتى لو فاضي) عشان يبقى مؤشر recovery
-  # موثوق — لو مفيش نتايج، الملف بيتعمل فاضي بس موجود، فمرة
-  # جاية السكريبت مش هيعتبر المرحلة "لسه محتاجة تتعمل".
   : > "$VULN/ffuf_all_found.txt"
   if [ "$FFUF_FILES" -gt 0 ]; then
     for f in "$VULN"/ffuf_*.json; do
       grep -oP '"url"\s*:\s*"\K[^"]+' "$f" 2>/dev/null
     done | sort -u > "$VULN/ffuf_all_found.txt"
-    ok "FFUF unique paths found: $(count_lines "$VULN/ffuf_all_found.txt")"
+    ok "FFUF unique paths found (baseline-filtered): $(count_lines "$VULN/ffuf_all_found.txt")"
   fi
 
   phase_end "11"
@@ -1267,16 +1219,16 @@ run_ffuf() {
 #  PHASE 12: XSS PREP
 # ===========================
 run_xss() {
-  phase "Phase 12: XSS Prep (Gxss filter → manual dalfox command)"
+  phase "Phase 12: XSS Prep (Gxss filter -> manual dalfox command)"
   phase_start "12"
 
   local SRC=""
   if [ -s "$VULN/gf_xss.txt" ]; then
     SRC="$VULN/gf_xss.txt"
-    log "  → Source: gf_xss.txt ($(count_lines "$SRC") URLs)"
+    log "  -> Source: gf_xss.txt ($(count_lines "$SRC") URLs)"
   elif [ -s "$URLS/params_urls.txt" ]; then
     SRC="$URLS/params_urls.txt"
-    log "  → Fallback: params_urls.txt ($(count_lines "$SRC") URLs)"
+    log "  -> Fallback: params_urls.txt ($(count_lines "$SRC") URLs)"
   else
     warn "No parameterized URLs for XSS prep — skipping."
     phase_end "12"
@@ -1290,10 +1242,6 @@ run_xss() {
   fi
   ok "After dedup: $(count_lines "$VULN/xss_dedup.txt") URLs"
 
-  # Gxss عداة قديمة نسبيًا ومش بتتصون بنشاط، وعلى targets كبيرة
-  # (زي hubspot) بتاخد وقت طويل أو تعلق. بما إن dalfox أصلاً
-  # بيعمل reflection check جوه شغله، مفيش داعي نصر على Gxss لو
-  # عدد الـ URLs كبير جدًا — نسيب الشغلانة كاملة لـ dalfox.
   local GXSS_SKIP_THRESHOLD=5000
 
   if command -v Gxss &>/dev/null && [ -s "$VULN/xss_dedup.txt" ]; then
@@ -1302,11 +1250,11 @@ run_xss() {
 
     if [ "$XSS_TOTAL" -gt "$GXSS_SKIP_THRESHOLD" ]; then
       warn "Gxss skipped: $XSS_TOTAL URLs > $GXSS_SKIP_THRESHOLD (Gxss is slow/unmaintained at this scale)."
-      warn "  dalfox will do its own reflection check instead — see run_dalfox.sh"
+      warn "  dalfox will do its own reflection check instead"
       cp "$VULN/xss_dedup.txt" "$VULN/xss_reflected.txt"
-      touch "$VULN/.gxss_skipped"   # عشان التقرير النهائي يوضح إن الرقم ده خام مش متحقق منه
+      touch "$VULN/.gxss_skipped"
     else
-      log "  → Running Gxss (reflection check) in batches..."
+      log "  -> Running Gxss (reflection check) in batches..."
       local GXSS_BATCH=500
       local total_chunks=$(( (XSS_TOTAL + GXSS_BATCH - 1) / GXSS_BATCH ))
       local start_chunk
@@ -1316,7 +1264,7 @@ run_xss() {
       if [ "$start_chunk" -eq 0 ]; then
         : > "$VULN/xss_reflected.txt"
       else
-        log "  → Resuming Gxss from batch $start_chunk/$total_chunks"
+        log "  -> Resuming Gxss from batch $start_chunk/$total_chunks"
       fi
 
       local tmp_dir
@@ -1329,13 +1277,14 @@ run_xss() {
         [ "$chunk_num" -le "$start_chunk" ] && continue
         CURRENT_ITEM=$chunk_num
         CURRENT_TOTAL=$total_chunks
-        printf "\r  → Gxss batch %d/%d" "$chunk_num" "$total_chunks"
+        printf "\r  -> Gxss batch %d/%d" "$chunk_num" "$total_chunks"
         cat "$chunk_file" | timeout 120 Gxss -c 50 2>/dev/null >> "$VULN/xss_reflected.txt"
         state_set '.progress.gxss.last_chunk' "$chunk_num"
       done
       echo ""
       rm -rf "$tmp_dir"
       sort -u -o "$VULN/xss_reflected.txt" "$VULN/xss_reflected.txt"
+      rm -f "$VULN/.gxss_skipped"
     fi
     ok "Gxss reflected URLs: $(count_lines "$VULN/xss_reflected.txt")"
   else
@@ -1373,7 +1322,10 @@ DALFOX_CMD
 
   ok "XSS prep done:"
   ok "  Reflected URLs : $(count_lines "$VULN/xss_reflected.txt")"
-  ok "  Dalfox command : $VULN/run_dalfox.sh  ← شغّله يدوي"
+  ok "  Dalfox command : $VULN/run_dalfox.sh  <- شغّله يدوي"
+  if [ -f "$VULN/.gxss_skipped" ]; then
+    warn "  Gxss was SKIPPED (URLs > $GXSS_SKIP_THRESHOLD) — xss_reflected.txt is RAW, NOT reflection-checked"
+  fi
   warn "  dalfox مش بتشتغل تلقائي — راجع الـ URLs الأول وبعدين شغّل run_dalfox.sh"
 
   phase_end "12"
@@ -1387,9 +1339,23 @@ report() {
   local REPORT="$OUT/summary_report.txt"
   local ELAPSED=$(( $(date +%s) - START_TIME ))
 
+  # Count nuclei severity
+  local N_CRIT=0 N_HIGH=0 N_MED=0
+  if [ -f "$VULN/.nuclei_severity_counts" ]; then
+    IFS=':' read -r N_CRIT N_HIGH N_MED < "$VULN/.nuclei_severity_counts"
+  fi
+
+  # Count unique JS secret values (not raw line matches)
+  local JS_SECRET_UNIQUE=0
+  if [ -f "$JS/secrets_values.txt" ]; then
+    JS_SECRET_UNIQUE=$(count_lines "$JS/secrets_values.txt")
+  elif [ -f "$JS/secrets.txt" ]; then
+    JS_SECRET_UNIQUE=$(count_lines "$JS/secrets.txt")
+  fi
+
   {
     echo "================================================"
-    echo "       SPIDER-RECON v3.1 — FINAL REPORT"
+    echo "       SPIDER-RECON v3.0 — FINAL REPORT"
     echo "================================================"
     echo "Target   : $DOMAIN"
     echo "Date     : $(date)"
@@ -1403,37 +1369,57 @@ report() {
     done
     echo ""
     echo "── ASSET DISCOVERY ────────────────────────────"
-    printf "  %-28s : %s\n" "Total Subdomains"    "$(count_lines "$SUBS/all.txt")"
-    printf "  %-28s : %s\n" "Resolved Subdomains" "$(count_lines "$SUBS/resolved_hosts.txt")"
-    printf "  %-28s : %s\n" "Live Hosts (httpx)"  "$(count_lines "$SUBS/live.txt")"
-    printf "  %-28s : %s\n" "Open Ports (naabu)"  "$(count_lines "$PORTS/naabu.txt")"
-    printf "  %-28s : %s\n" "Total URLs"          "$(count_lines "$URLS/all_urls.txt")"
-    printf "  %-28s : %s\n" "Parameterized URLs"  "$(count_lines "$URLS/params_urls.txt")"
-    printf "  %-28s : %s\n" "JS Files"            "$(count_lines "$JS/js_urls.txt")"
-    printf "  %-28s : %s\n" "JS Possible Secrets" "$(count_lines "$JS/secrets.txt")"
+    printf "  %-30s : %s\n" "Total Subdomains"       "$(count_lines "$SUBS/all.txt")"
+    printf "  %-30s : %s\n" "Resolved Subdomains"    "$(count_lines "$SUBS/resolved_hosts.txt")"
+    printf "  %-30s : %s\n" "Live Hosts (httpx)"     "$(count_lines "$SUBS/live.txt")"
+    printf "  %-30s : %s\n" "Open Ports (naabu)"     "$(count_lines "$PORTS/naabu.txt")"
+    printf "  %-30s : %s\n" "Total URLs"             "$(count_lines "$URLS/all_urls.txt")"
+    printf "  %-30s : %s\n" "Parameterized URLs"     "$(count_lines "$URLS/params_urls.txt")"
+    printf "  %-30s : %s\n" "JS Files"               "$(count_lines "$JS/js_urls.txt")"
+    printf "  %-30s : %s\n" "JS Unique Secrets"      "$JS_SECRET_UNIQUE"
     echo ""
-    echo "── VULNERABILITY CANDIDATES ───────────────────"
-    printf "  %-28s : %s\n" "Nuclei"               "$(count_lines "$VULN/nuclei.txt")"
-    printf "  %-28s : %s\n" "XSS reflected (Gxss)" "$(count_lines "$VULN/xss_reflected.txt")"
-    printf "  %-28s : %s\n" "XSS confirmed (dalfox)" "run $VULN/run_dalfox.sh manually"
-    printf "  %-28s : %s\n" "SQLi (gf)"            "$(count_lines "$VULN/gf_sqli.txt")"
-    printf "  %-28s : %s\n" "SSRF (gf)"     "$(count_lines "$VULN/gf_ssrf.txt")"
-    printf "  %-28s : %s\n" "LFI (gf)"      "$(count_lines "$VULN/gf_lfi.txt")"
-    printf "  %-28s : %s\n" "RCE (gf)"      "$(count_lines "$VULN/gf_rce.txt")"
-    printf "  %-28s : %s\n" "IDOR (gf)"     "$(count_lines "$VULN/gf_idor.txt")"
-    printf "  %-28s : %s\n" "Open Redirect" "$(count_lines "$VULN/gf_redirect.txt")"
-    printf "  %-28s : %s\n" "SSTI (gf)"     "$(count_lines "$VULN/gf_ssti.txt")"
-    printf "  %-28s : %s\n" "FFUF Paths"    "$(count_lines "$VULN/ffuf_all_found.txt")"
+    echo "── NUCLEI FINDINGS (by severity) ─────────────"
+    printf "  %-30s : %s\n" "Nuclei — Critical"      "$N_CRIT"
+    printf "  %-30s : %s\n" "Nuclei — High"          "$N_HIGH"
+    printf "  %-30s : %s\n" "Nuclei — Medium"        "$N_MED"
+    printf "  %-30s : %s\n" "Nuclei — Total"         "$(count_lines "$VULN/nuclei.txt")"
     echo ""
-    echo "── NEXT STEPS ─────────────────────────────────"
-    [ "$(count_lines "$VULN/nuclei.txt")"        -gt 0 ] && echo "  cat $VULN/nuclei.txt | grep -iE 'critical|high'"
-    [ "$(count_lines "$VULN/xss_reflected.txt")" -gt 0 ] && echo "  bash $VULN/run_dalfox.sh  ← XSS verification (يدوي)"
-    [ "$(count_lines "$JS/secrets.txt")"         -gt 0 ] && echo "  cat $JS/secrets.txt  ← review manually!"
-    [ "$(count_lines "$VULN/gf_sqli.txt")"     -gt 0 ] && echo "  cat $VULN/gf_sqli.txt | head -20  → sqlmap"
-    [ "$(count_lines "$VULN/gf_ssrf.txt")"     -gt 0 ] && echo "  cat $VULN/gf_ssrf.txt"
-    [ "$(count_lines "$VULN/gf_idor.txt")"     -gt 0 ] && echo "  cat $VULN/gf_idor.txt"
-    [ "$(count_lines "$VULN/gf_lfi.txt")"      -gt 0 ] && echo "  cat $VULN/gf_lfi.txt"
-    [ "$(count_lines "$VULN/ffuf_all_found.txt")" -gt 0 ] && echo "  cat $VULN/ffuf_all_found.txt"
+    echo "── UNVERIFIED PATTERN MATCHES (manual triage required) ──"
+    echo "  These are REGEX matches only — none have been dynamically validated."
+    echo "  Do not report or act on these without manual verification."
+    echo ""
+    printf "  %-30s : %s\n" "XSS (gf pattern)"        "$(count_lines "$VULN/gf_xss.txt")"
+    printf "  %-30s : %s\n" "SQLi (gf pattern)"       "$(count_lines "$VULN/gf_sqli.txt")"
+    printf "  %-30s : %s\n" "SSRF (gf pattern)"       "$(count_lines "$VULN/gf_ssrf.txt")"
+    printf "  %-30s : %s\n" "LFI (gf pattern)"        "$(count_lines "$VULN/gf_lfi.txt")"
+    printf "  %-30s : %s\n" "RCE (gf pattern)"        "$(count_lines "$VULN/gf_rce.txt")"
+    printf "  %-30s : %s\n" "IDOR (gf pattern)"       "$(count_lines "$VULN/gf_idor.txt")"
+    printf "  %-30s : %s\n" "Open Redirect (gf)"      "$(count_lines "$VULN/gf_redirect.txt")"
+    printf "  %-30s : %s\n" "SSTI (gf pattern)"       "$(count_lines "$VULN/gf_ssti.txt")"
+    echo ""
+    printf "  %-30s : %s\n" "XSS reflected (Gxss)"    "$(count_lines "$VULN/xss_reflected.txt")"
+    if [ -f "$VULN/.gxss_skipped" ]; then
+      echo "  ⚠ Gxss was SKIPPED (URL count exceeded threshold) — XSS reflected count is RAW"
+      echo "    (not reflection-checked; run dalfox for actual validation)"
+    fi
+    printf "  %-30s : %s\n" "FFUF paths (baseline-filtered)" "$(count_lines "$VULN/ffuf_all_found.txt")"
+    echo ""
+    echo "── NEXT STEPS (manual) ───────────────────────"
+    [ "$N_CRIT" -gt 0 ] && echo "  Nuclei critical findings:"
+    [ "$N_CRIT" -gt 0 ] && echo "    grep -E '\[critical\]' $VULN/nuclei.txt"
+    [ "$N_HIGH" -gt 0 ] && echo "  Nuclei high findings:"
+    [ "$N_HIGH" -gt 0 ] && echo "    grep -E '\[high\]' $VULN/nuclei.txt"
+    [ "$(count_lines "$VULN/xss_reflected.txt")" -gt 0 ] && echo "  XSS verification: bash $VULN/run_dalfox.sh  (يدوي)"
+    [ "$JS_SECRET_UNIQUE" -gt 0 ] && echo "  Review unique secrets: cat $JS/secrets_values.txt"
+    [ "$(count_lines "$VULN/gf_sqli.txt")" -gt 0 ] && echo "  SQLi triage: cat $VULN/gf_sqli.txt | head -30  -> sqlmap"
+    [ "$(count_lines "$VULN/gf_ssrf.txt")" -gt 0 ] && echo "  SSRF triage: cat $VULN/gf_ssrf.txt | head -30"
+    [ "$(count_lines "$VULN/gf_lfi.txt")" -gt 0 ] && echo "  LFI triage: cat $VULN/gf_lfi.txt | head -30"
+    [ "$(count_lines "$VULN/gf_rce.txt")" -gt 0 ] && echo "  RCE triage: cat $VULN/gf_rce.txt | head -30"
+    [ "$(count_lines "$VULN/gf_idor.txt")" -gt 0 ] && echo "  IDOR triage: cat $VULN/gf_idor.txt | head -30"
+    [ "$(count_lines "$VULN/ffuf_all_found.txt")" -gt 0 ] && echo "  FFUF paths: cat $VULN/ffuf_all_found.txt"
+    echo ""
+    echo "  State file kept at: $STATE_FILE"
+    echo "  (Delete it manually to force a full fresh scan next run)"
     echo "================================================"
   } | tee "$REPORT"
 
@@ -1444,11 +1430,6 @@ report() {
 #  MAIN
 # ===========================
 main() {
-  # لو المستخدم عمل Ctrl+C:
-  #  1. نقفل أي background jobs لسه شغالة (عشان ما تفضلش processes معلقة)
-  #  2. نطبعله تفاصيل واضحة: كام phase خلص، هو واقف فين بالظبط،
-  #     وعلى أي عنصر بالظبط لو كان جوه phase فيها loop (JS/ffuf)
-  #  3. نفك الـ lock عشان يقدر يشغل السكريبت تاني من غير ما يتقفل
   trap '
     echo -e "\n${YELLOW}${BOLD}[!] Interrupted — saving checkpoint...${NC}"
     jobs -p | xargs -r kill 2>/dev/null
@@ -1457,13 +1438,11 @@ main() {
     if [ "${CURRENT_TOTAL:-0}" -gt 0 ] 2>/dev/null; then
       echo -e "  Current item     : $CURRENT_ITEM / $CURRENT_TOTAL"
     fi
-    echo -e "${NC}\n${GREEN}Checkpoint saved successfully.${NC}\nRun the exact same command again to resume.\n"
+    echo -e "${NC}\n${GREEN}Checkpoint saved.${NC}\nRun the exact same command again to resume.\n"
     release_lock
     exit 130
   ' INT
 
-  # لو السكريبت اتقفل بأي طريقة تانية (error، kill عادي، إلخ)
-  # برضو نفك الـ lock عشان تشغيلة جديدة متتقفلش من غير داعي
   trap 'release_lock' EXIT
 
   banner
@@ -1484,9 +1463,10 @@ main() {
   run_phase "xss"        run_xss
 
   report
-  rm -f "$STATE_FILE"   # خلص كل حاجة بنجاح → مرة جاية هتبقى scan جديد مش resume
+  # State file intentionally kept — delete manually for full fresh scan
   release_lock
-  echo -e "\n${GREEN}${BOLD}[✔] Spider-Recon v2.4 done! Output: $OUT${NC}"
+  echo -e "\n${GREEN}${BOLD}[✔] Spider-Recon v3.0 done! Output: $OUT${NC}"
+  echo -e "${CYAN}State file: $STATE_FILE (kept for resume; delete to force clean start)${NC}"
 }
 
 main
