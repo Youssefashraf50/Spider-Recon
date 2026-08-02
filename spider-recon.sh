@@ -12,6 +12,9 @@
 #  - subjs per-host timeout instead of single global timeout
 #  - inprogress marker cleanup via trap for crash safety
 #  - State file kept on completion (manual delete needed for full reset)
+#  - Port scanning (naabu) REMOVED — low value for bug bounty recon and
+#    triggers WAF/IP bans too easily
+#  - Katana now also crawls passive URL sources (gau/wayback), not just live hosts
 # ============================================================
 
 set -o pipefail
@@ -33,7 +36,7 @@ RUN_AMASS=false
 RESET=false
 STATE_FILE=""
 LOCK_FILE=""
-TOTAL_PHASES=10
+TOTAL_PHASES=9
 TOTAL_PHASES_DONE=0
 CURRENT_PHASE_NAME=""
 CURRENT_ITEM=0
@@ -159,7 +162,7 @@ fi
 #  ROOT CHECK
 # ===========================
 if [ "$EUID" -ne 0 ]; then
-  warn "Not running as root — naabu may need sudo for SYN scan."
+  warn "Not running as root — some tools may need elevated privileges for certain features."
 fi
 
 # ===========================
@@ -197,7 +200,7 @@ init_state() {
   if [ "$RESET" = true ]; then
     warn "Reset (-r) requested — clearing saved state, starting fresh."
     rm -f "$STATE_FILE" "$JS/.in_progress" "$VULN/.in_progress" \
-          "$PORTS/naabu.txt.inprogress" "$SUBS/live_detailed.txt.inprogress"
+          "$SUBS/live_detailed.txt.inprogress"
   fi
 
   if [ ! -f "$STATE_FILE" ]; then
@@ -258,7 +261,6 @@ is_phase_done() {
   fi
   case "$phase" in
     subdomains) [ -s "$SUBS/resolved_hosts.txt" ] ;;
-    ports)      [ -f "$PORTS/naabu.txt" ] && [ ! -f "$PORTS/naabu.txt.inprogress" ] ;;
     probe)      [ -s "$SUBS/live_detailed.txt" ] && [ ! -f "$SUBS/live_detailed.txt.inprogress" ] ;;
     urls)       [ -s "$URLS/all_urls.txt" ] ;;
     js)         [ -f "$JS/js_urls.txt" ] && [ ! -f "$JS/.in_progress" ] ;;
@@ -414,11 +416,8 @@ install_dependencies() {
   phase "Dependency Check"
 
   check_tool subfinder   "go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest"
-  check_tool assetfinder "go install github.com/tomnomnom/assetfinder@latest"
-  check_tool amass       "go install -v github.com/owasp-amass/amass/v4/...@master"
   check_tool dnsx        "go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest"
   check_tool httpx       "go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest"
-  check_tool naabu       "go install -v github.com/projectdiscovery/naabu/v2/cmd/naabu@latest"
   check_tool gau         "go install github.com/lc/gau/v2/cmd/gau@latest"
   check_tool waybackurls "go install github.com/tomnomnom/waybackurls@latest"
   check_tool katana      "go install github.com/projectdiscovery/katana/cmd/katana@latest"
@@ -432,6 +431,27 @@ install_dependencies() {
   check_tool unfurl      "go install github.com/tomnomnom/unfurl@latest"
   check_tool subjs       "go install github.com/lc/subjs@latest"
   check_tool Gxss        "go install github.com/KathanP19/Gxss@latest"
+
+  # sublist3r (python tool, not a go install)
+  if ! command -v sublist3r &>/dev/null; then
+    warn "sublist3r not found — installing..."
+    if pip install -q sublist3r &>/dev/null && command -v sublist3r &>/dev/null; then
+      ok "sublist3r installed."
+    else
+      local SUB3_DIR="$HOME/.local/share/Sublist3r"
+      if [ ! -d "$SUB3_DIR" ]; then
+        git clone -q https://github.com/aboul3la/Sublist3r "$SUB3_DIR" &>/dev/null
+      fi
+      if [ -f "$SUB3_DIR/sublist3r.py" ]; then
+        pip install -q -r "$SUB3_DIR/requirements.txt" &>/dev/null
+        ok "sublist3r cloned to $SUB3_DIR (will be invoked via python3 sublist3r.py)"
+      else
+        err "Failed to install sublist3r (continuing)."
+      fi
+    fi
+  else
+    ok "sublist3r ✓"
+  fi
 
   command -v paramspider &>/dev/null || pip install -q paramspider 2>/dev/null
   command -v arjun       &>/dev/null || pip install -q arjun 2>/dev/null
@@ -531,8 +551,7 @@ setup_dirs() {
   URLS="$OUT/urls"
   VULN="$OUT/vuln"
   JS="$OUT/js"
-  PORTS="$OUT/ports"
-  mkdir -p "$SUBS" "$URLS" "$VULN" "$JS" "$PORTS"
+  mkdir -p "$SUBS" "$URLS" "$VULN" "$JS"
 
   init_state
   acquire_lock
@@ -547,55 +566,33 @@ enum_subdomains() {
   phase "Phase 1: Subdomain Enumeration"
   phase_start "1"
 
-  log "  -> Launching subfinder + assetfinder + crt.sh + amass in parallel..."
+  log "  -> Launching subfinder + sublist3r in parallel..."
 
   ( timeout 180 subfinder -d "$DOMAIN" -all -silent \
       -o "$SUBS/subfinder.txt" 2>/dev/null \
       || { warn "subfinder timed out"; touch "$SUBS/subfinder.txt"; } ) &
   local PID_SUB=$!
 
-  ( timeout 90 assetfinder --subs-only "$DOMAIN" 2>/dev/null \
-      > "$SUBS/assetfinder.txt" \
-      || { warn "assetfinder timed out"; touch "$SUBS/assetfinder.txt"; } ) &
-  local PID_ASSET=$!
-
   (
-    touch "$SUBS/crtsh.txt"
-    for attempt in 1 2 3; do
-      RAW=$(timeout 45 curl -s -L \
-        -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64)" \
-        --retry 2 --retry-delay 3 \
-        "https://crt.sh/?q=%25.$DOMAIN&output=json" 2>/dev/null)
-
-      if echo "$RAW" | grep -q "name_value"; then
-        echo "$RAW" \
-          | grep -oP '"name_value"\s*:\s*"\K[^"]+' \
-          | tr ',' '\n' \
-          | sed 's/^\*\.//' \
-          | grep -E "(^|\.)${DOMAIN}$" \
-          | sort -u > "$SUBS/crtsh.txt"
-        break
+    touch "$SUBS/sublist3r.txt"
+    if command -v sublist3r &>/dev/null; then
+      timeout 180 sublist3r -d "$DOMAIN" -o "$SUBS/sublist3r.txt" &>/dev/null \
+        || warn "sublist3r timed out"
+    else
+      local SUB3_SCRIPT="$HOME/.local/share/Sublist3r/sublist3r.py"
+      if [ -f "$SUB3_SCRIPT" ]; then
+        timeout 180 python3 "$SUB3_SCRIPT" -d "$DOMAIN" -o "$SUBS/sublist3r.txt" &>/dev/null \
+          || warn "sublist3r timed out"
+      else
+        warn "sublist3r not installed — skipping"
       fi
-      sleep 5
-    done
+    fi
   ) &
-  local PID_CRT=$!
+  local PID_SUB3=$!
 
-  if [ "$RUN_AMASS" = true ]; then
-    log "  -> amass enabled (-a): this can take several minutes, be patient"
-    ( timeout 420 amass enum -passive -d "$DOMAIN" -timeout 5 -silent \
-        2>/dev/null > "$SUBS/amass.txt" \
-        || { warn "amass timed out after 7min — partial results still used"; } ) &
-    local PID_AMASS=$!
-  else
-    log "  -> amass skipped (subfinder -all already covers most passive sources; use -a to enable)"
-    touch "$SUBS/amass.txt"
-    local PID_AMASS=""
-  fi
+  wait "$PID_SUB" "$PID_SUB3" 2>/dev/null
 
-  wait "$PID_SUB" "$PID_ASSET" "$PID_CRT" ${PID_AMASS:+$PID_AMASS} 2>/dev/null
-
-  ok "subfinder: $(count_lines "$SUBS/subfinder.txt")  assetfinder: $(count_lines "$SUBS/assetfinder.txt")  crt.sh: $(count_lines "$SUBS/crtsh.txt")  amass: $(count_lines "$SUBS/amass.txt")"
+  ok "subfinder: $(count_lines "$SUBS/subfinder.txt")  sublist3r: $(count_lines "$SUBS/sublist3r.txt")"
 
   cat "$SUBS"/*.txt 2>/dev/null \
     | grep -E "(^|\.)${DOMAIN}$" \
@@ -635,52 +632,16 @@ enum_subdomains() {
 }
 
 # ===========================
-#  PHASE 2: PORT SCANNING
-# ===========================
-scan_ports() {
-  phase "Phase 2: Port Scanning"
-  phase_start "2"
-
-  if ! command -v naabu &>/dev/null; then
-    warn "naabu not found, skipping."
-    touch "$PORTS/naabu.txt"
-    phase_end "2"
-    return
-  fi
-
-  if [ ! -s "$SUBS/resolved_hosts.txt" ]; then
-    warn "No resolved hosts — skipping port scan."
-    touch "$PORTS/naabu.txt"
-    phase_end "2"
-    return
-  fi
-
-  naabu_chunk_cmd() {
-    local chunk_file="$1" out_file="$2"
-    naabu -l "$chunk_file" -top-ports 100 -silent -rate "$RATE_LIMIT" -timeout 5 \
-      2>/dev/null >> "$out_file" || true
-  }
-  run_chunked_scan "naabu" "$SUBS/resolved_hosts.txt" 50 "$PORTS/naabu.txt" naabu_chunk_cmd
-
-  ok "Open ports: $(count_lines "$PORTS/naabu.txt") entries"
-
-  log "  -> Cooldown 30s (allow any temporary CDN rate-limit to subside before httpx)..."
-  sleep 30
-
-  phase_end "2"
-}
-
-# ===========================
-#  PHASE 3: PROBE LIVE HOSTS
+#  PHASE 2: PROBE LIVE HOSTS
 # ===========================
 probe_hosts() {
-  phase "Phase 3: Probing Live Hosts"
-  phase_start "3"
+  phase "Phase 2: Probing Live Hosts"
+  phase_start "2"
 
   if [ ! -s "$SUBS/resolved_hosts.txt" ]; then
     warn "No resolved hosts to probe."
     touch "$SUBS/live.txt" "$SUBS/live_detailed.txt"
-    phase_end "3"
+    phase_end "2"
     return
   fi
 
@@ -720,7 +681,7 @@ probe_hosts() {
   LIVE_COUNT=$(count_lines "$SUBS/live.txt")
 
   if [ "$LIVE_COUNT" -eq 0 ]; then
-    warn "Zero live hosts — likely still rate-limited by target's CDN after naabu. Retrying in 90s..."
+    warn "Zero live hosts — likely rate-limited by target's CDN. Retrying in 90s..."
     sleep 90
     state_set '.progress.httpx.last_chunk' 0
     run_chunked_scan "httpx" "$SUBS/resolved_hosts.txt" 30 "$SUBS/live_detailed.txt" httpx_chunk_cmd
@@ -740,15 +701,15 @@ probe_hosts() {
     warn "  Manual test: httpx -u $DOMAIN -title -status-code"
   fi
 
-  phase_end "3"
+  phase_end "2"
 }
 
 # ===========================
-#  PHASE 4-6: URL COLLECTION
+#  PHASE 3-5: URL COLLECTION
 # ===========================
 collect_urls() {
-  phase "Phase 4: Passive URL Collection (gau + wayback)"
-  phase_start "4"
+  phase "Phase 3: Passive URL Collection (gau + wayback)"
+  phase_start "3"
 
   if [ -s "$SUBS/live.txt" ]; then
     cat "$SUBS/live.txt" \
@@ -765,17 +726,23 @@ collect_urls() {
     | anew "$URLS/wayback.txt" >/dev/null || true
   ok "Wayback URLs: $(count_lines "$URLS/wayback.txt")"
 
-  phase_end "4"
+  phase_end "3"
 
-  phase "Phase 5: Active Crawling (katana)"
-  phase_start "5"
+  phase "Phase 4: Active Crawling (katana)"
+  phase_start "4"
 
   local KATANA_DEPTH=2
   [ "$DEEP_PROBE" = true ] && KATANA_DEPTH=3
 
-  if [ -s "$SUBS/live.txt" ]; then
+  # Katana input: live hosts + whatever gau/wayback already found (passive URLs)
+  # so katana also crawls known URLs directly, not just root hosts — this
+  # surfaces JS/endpoints those tools didn't fully render.
+  cat "$SUBS/live.txt" "$URLS/gau.txt" "$URLS/wayback.txt" 2>/dev/null \
+    | grep -E "^https?://" | sort -u > "$URLS/katana_input.txt"
+
+  if [ -s "$URLS/katana_input.txt" ]; then
     katana \
-      -list "$SUBS/live.txt" \
+      -list "$URLS/katana_input.txt" \
       -d "$KATANA_DEPTH" \
       -jc \
       -kf all \
@@ -784,7 +751,7 @@ collect_urls() {
       -timeout 10 \
       -silent \
       -o "$URLS/katana.txt" 2>/dev/null || true
-    ok "Katana URLs (depth $KATANA_DEPTH): $(count_lines "$URLS/katana.txt")"
+    ok "Katana URLs (depth $KATANA_DEPTH, $(count_lines "$URLS/katana_input.txt") seed URLs): $(count_lines "$URLS/katana.txt")"
 
     if [ "$RUN_GOSPIDER" = true ] && command -v gospider &>/dev/null; then
       log "  -> gospider (extra coverage, -g enabled)..."
@@ -804,10 +771,10 @@ collect_urls() {
     warn "No live hosts to crawl — skipping katana/gospider."
   fi
 
-  phase_end "5"
+  phase_end "4"
 
-  phase "Phase 6: Parameter Discovery (paramspider)"
-  phase_start "6"
+  phase "Phase 5: Parameter Discovery (paramspider)"
+  phase_start "5"
 
   if command -v paramspider &>/dev/null; then
     timeout 120 paramspider -d "$DOMAIN" -q 2>/dev/null
@@ -832,15 +799,15 @@ collect_urls() {
     | sort -u > "$URLS/all_urls.txt"
   ok "Total unique URLs: $(count_lines "$URLS/all_urls.txt")"
 
-  phase_end "6"
+  phase_end "5"
 }
 
 # ===========================
-#  PHASE 7: JS ANALYSIS
+#  PHASE 6: JS ANALYSIS
 # ===========================
 analyze_js() {
-  phase "Phase 7: JavaScript Analysis"
-  phase_start "7"
+  phase "Phase 6: JavaScript Analysis"
+  phase_start "6"
 
   # Collect JS URLs from URL corpus
   grep -iE "\.js(\?|$)" "$URLS/all_urls.txt" 2>/dev/null \
@@ -939,15 +906,15 @@ analyze_js() {
     rm -f "$JS/.in_progress"
   fi
 
-  phase_end "7"
+  phase_end "6"
 }
 
 # ===========================
-#  PHASE 8: FILTER URLS
+#  PHASE 7: FILTER URLS
 # ===========================
 filter_urls() {
-  phase "Phase 8: URL Filtering"
-  phase_start "8"
+  phase "Phase 7: URL Filtering"
+  phase_start "7"
 
   grep -iE "\.(php|asp|aspx|jsp|json|xml|do|action|cgi)(\?|$)" \
     "$URLS/all_urls.txt" 2>/dev/null \
@@ -965,15 +932,15 @@ filter_urls() {
   fi
 
   ok "Filtered (ext): $(count_lines "$URLS/filtered.txt") | Parameterized: $(count_lines "$URLS/params_urls.txt")"
-  phase_end "8"
+  phase_end "7"
 }
 
 # ===========================
-#  PHASE 9: GF PATTERNS
+#  PHASE 8: GF PATTERNS
 # ===========================
 gf_patterns() {
-  phase "Phase 9: GF Pattern Matching"
-  phase_start "9"
+  phase "Phase 8: GF Pattern Matching"
+  phase_start "8"
 
   local GF_DIR="$HOME/.config/gf"
   local PATTERNS=(xss sqli ssrf lfi rce idor redirect ssti)
@@ -981,14 +948,14 @@ gf_patterns() {
   if [ ! -s "$URLS/all_urls.txt" ]; then
     warn "all_urls.txt is empty — skipping gf"
     for pat in "${PATTERNS[@]}"; do touch "$VULN/gf_$pat.txt"; done
-    phase_end "9"
+    phase_end "8"
     return
   fi
 
   if [ ! -d "$GF_DIR" ] || [ -z "$(ls -A "$GF_DIR"/*.json 2>/dev/null)" ]; then
     warn "gf patterns missing — run install step first"
     for pat in "${PATTERNS[@]}"; do touch "$VULN/gf_$pat.txt"; done
-    phase_end "9"
+    phase_end "8"
     return
   fi
 
@@ -1016,20 +983,20 @@ gf_patterns() {
     warn "  Manual: cat $URLS/all_urls.txt | grep '=' | head -5"
   fi
 
-  phase_end "9"
+  phase_end "8"
 }
 
 # ===========================
-#  PHASE 10: NUCLEI
+#  PHASE 9: NUCLEI
 # ===========================
 run_nuclei() {
-  phase "Phase 10: Nuclei Scanning"
-  phase_start "10"
+  phase "Phase 9: Nuclei Scanning"
+  phase_start "9"
 
   if ! command -v nuclei &>/dev/null; then
     warn "nuclei not found, skipping."
     touch "$VULN/nuclei.txt"
-    phase_end "10"
+    phase_end "9"
     return
   fi
 
@@ -1047,7 +1014,7 @@ run_nuclei() {
   if [ ! -s "$SUBS/live.txt" ]; then
     warn "live.txt empty — skipping nuclei"
     touch "$VULN/nuclei.txt"
-    phase_end "10"
+    phase_end "9"
     return
   fi
 
@@ -1084,25 +1051,25 @@ run_nuclei() {
     warn "  Check errors: cat $VULN/nuclei_errors.txt | head -20"
   fi
 
-  phase_end "10"
+  phase_end "9"
 }
 
 # ===========================
-#  PHASE 11: FFUF
+#  PHASE 10: FFUF
 # ===========================
 run_ffuf() {
-  phase "Phase 11: Content Discovery (ffuf)"
-  phase_start "11"
+  phase "Phase 10: Content Discovery (ffuf)"
+  phase_start "10"
 
   if [ ! -f "$WORDLIST" ]; then
     warn "No wordlist found — skipping ffuf."
-    phase_end "11"
+    phase_end "10"
     return
   fi
 
   if [ ! -s "$SUBS/live.txt" ]; then
     warn "No live hosts — skipping ffuf."
-    phase_end "11"
+    phase_end "10"
     return
   fi
 
@@ -1212,15 +1179,15 @@ run_ffuf() {
     ok "FFUF unique paths found (baseline-filtered): $(count_lines "$VULN/ffuf_all_found.txt")"
   fi
 
-  phase_end "11"
+  phase_end "10"
 }
 
 # ===========================
-#  PHASE 12: XSS PREP
+#  PHASE 11: XSS PREP
 # ===========================
 run_xss() {
-  phase "Phase 12: XSS Prep (Gxss filter -> manual dalfox command)"
-  phase_start "12"
+  phase "Phase 11: XSS Prep (Gxss filter -> manual dalfox command)"
+  phase_start "11"
 
   local SRC=""
   if [ -s "$VULN/gf_xss.txt" ]; then
@@ -1231,7 +1198,7 @@ run_xss() {
     log "  -> Fallback: params_urls.txt ($(count_lines "$SRC") URLs)"
   else
     warn "No parameterized URLs for XSS prep — skipping."
-    phase_end "12"
+    phase_end "11"
     return
   fi
 
@@ -1328,7 +1295,7 @@ DALFOX_CMD
   fi
   warn "  dalfox مش بتشتغل تلقائي — راجع الـ URLs الأول وبعدين شغّل run_dalfox.sh"
 
-  phase_end "12"
+  phase_end "11"
 }
 
 # ===========================
@@ -1363,7 +1330,7 @@ report() {
     echo "Output   : $OUT"
     echo ""
     echo "── PHASE TIMINGS ──────────────────────────────"
-    for ph in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    for ph in 1 2 3 4 5 6 7 8 9 10 11; do
       local dur="${PHASE_TIMES["${ph}_dur"]}"
       [ -n "$dur" ] && printf "  Phase %-2s : %ss\n" "$ph" "$dur"
     done
@@ -1372,7 +1339,6 @@ report() {
     printf "  %-30s : %s\n" "Total Subdomains"       "$(count_lines "$SUBS/all.txt")"
     printf "  %-30s : %s\n" "Resolved Subdomains"    "$(count_lines "$SUBS/resolved_hosts.txt")"
     printf "  %-30s : %s\n" "Live Hosts (httpx)"     "$(count_lines "$SUBS/live.txt")"
-    printf "  %-30s : %s\n" "Open Ports (naabu)"     "$(count_lines "$PORTS/naabu.txt")"
     printf "  %-30s : %s\n" "Total URLs"             "$(count_lines "$URLS/all_urls.txt")"
     printf "  %-30s : %s\n" "Parameterized URLs"     "$(count_lines "$URLS/params_urls.txt")"
     printf "  %-30s : %s\n" "JS Files"               "$(count_lines "$JS/js_urls.txt")"
@@ -1452,7 +1418,6 @@ main() {
   setup_dirs
 
   run_phase "subdomains" enum_subdomains
-  run_phase "ports"      scan_ports
   run_phase "probe"      probe_hosts
   run_phase "urls"       collect_urls
   run_phase "js"         analyze_js
