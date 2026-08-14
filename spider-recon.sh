@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================
-#  Spider-Recon v3.0  -  Bug Bounty Automation
+#  Spider-Recon v3.1  -  Bug Bounty Automation
 #  By: Youssef Ashraf
 # ============================================================
 #  v3.0 changes:
@@ -27,6 +27,13 @@
 #    size on big targets
 #  - New: vuln/idor_priority.txt — auto-extracted numeric-ID/UUID param
 #    candidates from gf_idor.txt, so you don't have to eyeball hundreds of URLs
+#  - New: priority files for ssrf/lfi/rce/sqli, each ranked with a DIFFERENT
+#    signal than IDOR — IDOR ranks by VALUE shape (numeric id/UUID), these
+#    rank by PARAM NAME (e.g. url=/redirect= for SSRF, file=/path= for LFI,
+#    cmd=/exec= for RCE) since that's what actually predicts exploitability
+#    for those bug classes. See gf_patterns() for the per-class reasoning.
+#  - New: vuln/auth_priority.txt — path/param based (not a gf pattern),
+#    flags admin/account/settings/token/role endpoints worth manual review
 # ============================================================
 
 set -o pipefail
@@ -48,7 +55,7 @@ RUN_AMASS=false
 RESET=false
 STATE_FILE=""
 LOCK_FILE=""
-TOTAL_PHASES=9
+TOTAL_PHASES=11
 TOTAL_PHASES_DONE=0
 CURRENT_PHASE_NAME=""
 CURRENT_ITEM=0
@@ -1076,12 +1083,32 @@ gf_patterns() {
     warn "  Manual: cat $URLS/all_urls.txt | grep '=' | head -5"
   fi
 
-  # === IDOR PRIORITY CANDIDATES ===
-  # gf_idor.txt is unranked — every param-bearing URL gf's regex thinks looks
-  # ID-like ends up in one flat list. In practice the URLs worth testing by
-  # hand are the ones with a plain numeric ID or a UUID in the value, since
-  # those are what you'd actually swap to test authorization. This pulls
-  # those out into a short list instead of a wall of hundreds of URLs.
+  # === PRIORITY CANDIDATES ===
+  # gf_*.txt files are unranked — every URL gf's regex thinks looks relevant
+  # ends up in one flat list, often hundreds of lines. The signal that
+  # actually predicts "worth manual testing" is DIFFERENT per bug class:
+  #
+  #   - IDOR : the VALUE shape matters (a plain numeric id or a UUID is
+  #            what you'd actually swap to test authorization). The param
+  #            name is secondary.
+  #   - SSRF/LFI/RCE : the VALUE is often opaque or already URL-encoded, so
+  #            value-shape filtering is unreliable. What predicts exploit-
+  #            ability is the PARAM NAME itself — a param called `url=` or
+  #            `redirect=` gets treated as SSRF-relevant by *any* pentester
+  #            regardless of what's currently in the value, because that's
+  #            what the app code will do with it. Same logic for `file=`/
+  #            `path=` (LFI) and `cmd=`/`exec=` (RCE).
+  #   - SQLi : a middle ground — classic SQLi-prone params (id/sort/order/
+  #            filter/search/category) are known from experience regardless
+  #            of value, so this also ranks by param name, but against a
+  #            different keyword set than SSRF/LFI/RCE since SQL sinks are
+  #            reached through different param semantics than URL-fetch or
+  #            command-exec sinks.
+  #
+  # Each block below sources its own gf_<pattern>.txt and writes a much
+  # shorter *_priority.txt next to it.
+
+  # --- IDOR: value-shape signal (numeric id / UUID) ---
   : > "$VULN/idor_priority.txt"
   if [ -s "$VULN/gf_idor.txt" ]; then
     grep -E '[?&][A-Za-z_]*(id|uid|user|account|order|file|project|invoice|doc)[A-Za-z_]*=[0-9]+([&#]|$)' \
@@ -1090,11 +1117,64 @@ gf_patterns() {
       "$VULN/gf_idor.txt" 2>/dev/null | sort -u >> "$VULN/idor_priority.txt"
     sort -u -o "$VULN/idor_priority.txt" "$VULN/idor_priority.txt"
   fi
-  local IDOR_PRIORITY_COUNT
-  IDOR_PRIORITY_COUNT=$(count_lines "$VULN/idor_priority.txt")
-  if [ "$IDOR_PRIORITY_COUNT" -gt 0 ]; then
-    ok "IDOR priority candidates (numeric ID / UUID params): $IDOR_PRIORITY_COUNT -> $VULN/idor_priority.txt"
+
+  # --- SSRF: param-name signal (outbound-fetch keywords) ---
+  # These are the param names that make an app fetch/redirect to a
+  # user-controlled destination. Value shape is ignored on purpose.
+  : > "$VULN/ssrf_priority.txt"
+  if [ -s "$VULN/gf_ssrf.txt" ]; then
+    grep -EiI '[?&][A-Za-z_]*(url|uri|link|redirect|return|returnurl|return_to|next|continue|dest|destination|target|callback|webhook|proxy|fetch|feed|src|source|host|domain|site|out|image|avatar|imgurl|path)[A-Za-z_]*=' \
+      "$VULN/gf_ssrf.txt" 2>/dev/null | sort -u > "$VULN/ssrf_priority.txt"
   fi
+
+  # --- LFI: param-name signal (filesystem/path keywords) ---
+  : > "$VULN/lfi_priority.txt"
+  if [ -s "$VULN/gf_lfi.txt" ]; then
+    grep -EiI '[?&][A-Za-z_]*(file|filename|path|folder|dir|directory|page|template|tpl|view|load|include|inc|doc|document|resource|download|content|module|layout)[A-Za-z_]*=' \
+      "$VULN/gf_lfi.txt" 2>/dev/null | sort -u > "$VULN/lfi_priority.txt"
+  fi
+
+  # --- RCE: param-name signal (command/exec keywords) ---
+  : > "$VULN/rce_priority.txt"
+  if [ -s "$VULN/gf_rce.txt" ]; then
+    grep -EiI '[?&][A-Za-z_]*(cmd|command|exec|execute|run|shell|system|ping|host|ip|proc|process|func|function|action|do|task|job|query|eval|code)[A-Za-z_]*=' \
+      "$VULN/gf_rce.txt" 2>/dev/null | sort -u > "$VULN/rce_priority.txt"
+  fi
+
+  # --- SQLi: param-name signal, but a different keyword set than above ---
+  # Classic SQL-sink params: things that end up straight in a WHERE/ORDER
+  # BY/LIKE clause. Different semantics than "fetch a URL" or "run a
+  # command", so a separate list rather than reusing the SSRF/RCE one.
+  : > "$VULN/sqli_priority.txt"
+  if [ -s "$VULN/gf_sqli.txt" ]; then
+    grep -EiI '[?&][A-Za-z_]*(id|uid|pid|cat|category|sort|order|orderby|filter|search|q|query|keyword|name|user|username|product|item|invoice|page|ref)[A-Za-z_]*=' \
+      "$VULN/gf_sqli.txt" 2>/dev/null | sort -u > "$VULN/sqli_priority.txt"
+  fi
+
+  local IDOR_PRIORITY_COUNT SSRF_PRIORITY_COUNT LFI_PRIORITY_COUNT RCE_PRIORITY_COUNT SQLI_PRIORITY_COUNT
+  IDOR_PRIORITY_COUNT=$(count_lines "$VULN/idor_priority.txt")
+  SSRF_PRIORITY_COUNT=$(count_lines "$VULN/ssrf_priority.txt")
+  LFI_PRIORITY_COUNT=$(count_lines "$VULN/lfi_priority.txt")
+  RCE_PRIORITY_COUNT=$(count_lines "$VULN/rce_priority.txt")
+  SQLI_PRIORITY_COUNT=$(count_lines "$VULN/sqli_priority.txt")
+  [ "$IDOR_PRIORITY_COUNT" -gt 0 ] && ok "IDOR priority (numeric ID / UUID values): $IDOR_PRIORITY_COUNT -> $VULN/idor_priority.txt"
+  [ "$SSRF_PRIORITY_COUNT" -gt 0 ] && ok "SSRF priority (url/redirect/callback params): $SSRF_PRIORITY_COUNT -> $VULN/ssrf_priority.txt"
+  [ "$LFI_PRIORITY_COUNT" -gt 0 ] && ok "LFI priority (file/path/template params): $LFI_PRIORITY_COUNT -> $VULN/lfi_priority.txt"
+  [ "$RCE_PRIORITY_COUNT" -gt 0 ] && ok "RCE priority (cmd/exec/run params): $RCE_PRIORITY_COUNT -> $VULN/rce_priority.txt"
+  [ "$SQLI_PRIORITY_COUNT" -gt 0 ] && ok "SQLi priority (id/sort/filter/search params): $SQLI_PRIORITY_COUNT -> $VULN/sqli_priority.txt"
+
+  # === AUTH PRIORITY (not a gf pattern — path/param based, from all URLs) ===
+  # No gf pattern for "auth" exists, so this scans every collected URL for
+  # admin/account/privilege-adjacent paths and params, since those are the
+  # endpoints worth checking by hand for broken access control / auth bypass.
+  : > "$VULN/auth_priority.txt"
+  if [ -s "$URLS/all_urls.txt" ]; then
+    grep -EiI '(/(admin|administrator|account|accounts|settings|profile|manage|dashboard|users?|role|permission|password|reset|token|session|2fa|mfa)(/|\?|$))|([?&][A-Za-z_]*(role|isadmin|is_admin|admin|token|session|jwt|auth)[A-Za-z_]*=)' \
+      "$URLS/all_urls.txt" 2>/dev/null | sort -u > "$VULN/auth_priority.txt"
+  fi
+  local AUTH_PRIORITY_COUNT
+  AUTH_PRIORITY_COUNT=$(count_lines "$VULN/auth_priority.txt")
+  [ "$AUTH_PRIORITY_COUNT" -gt 0 ] && ok "Auth priority (admin/account/token paths & params): $AUTH_PRIORITY_COUNT -> $VULN/auth_priority.txt"
 
   phase_end "8"
 }
@@ -1469,13 +1549,18 @@ report() {
     echo ""
     printf "  %-30s : %s\n" "XSS (gf pattern)"        "$(count_lines "$VULN/gf_xss.txt")"
     printf "  %-30s : %s\n" "SQLi (gf pattern)"       "$(count_lines "$VULN/gf_sqli.txt")"
+    printf "  %-30s : %s\n" "  -> priority (id/sort/filter/search params)" "$(count_lines "$VULN/sqli_priority.txt")"
     printf "  %-30s : %s\n" "SSRF (gf pattern)"       "$(count_lines "$VULN/gf_ssrf.txt")"
+    printf "  %-30s : %s\n" "  -> priority (url/redirect/callback params)" "$(count_lines "$VULN/ssrf_priority.txt")"
     printf "  %-30s : %s\n" "LFI (gf pattern)"        "$(count_lines "$VULN/gf_lfi.txt")"
+    printf "  %-30s : %s\n" "  -> priority (file/path/template params)" "$(count_lines "$VULN/lfi_priority.txt")"
     printf "  %-30s : %s\n" "RCE (gf pattern)"        "$(count_lines "$VULN/gf_rce.txt")"
+    printf "  %-30s : %s\n" "  -> priority (cmd/exec/run params)" "$(count_lines "$VULN/rce_priority.txt")"
     printf "  %-30s : %s\n" "IDOR (gf pattern)"       "$(count_lines "$VULN/gf_idor.txt")"
-    printf "  %-30s : %s\n" "  -> priority (numeric ID/UUID)" "$(count_lines "$VULN/idor_priority.txt")"
+    printf "  %-30s : %s\n" "  -> priority (numeric ID/UUID values)" "$(count_lines "$VULN/idor_priority.txt")"
     printf "  %-30s : %s\n" "Open Redirect (gf)"      "$(count_lines "$VULN/gf_redirect.txt")"
     printf "  %-30s : %s\n" "SSTI (gf pattern)"       "$(count_lines "$VULN/gf_ssti.txt")"
+    printf "  %-30s : %s\n" "Auth priority (admin/token paths)" "$(count_lines "$VULN/auth_priority.txt")"
     echo ""
     printf "  %-30s : %s\n" "XSS reflected (Gxss)"    "$(count_lines "$VULN/xss_reflected.txt")"
     if [ -f "$VULN/.gxss_skipped" ]; then
@@ -1491,12 +1576,17 @@ report() {
     [ "$N_HIGH" -gt 0 ] && echo "    grep -E '\[high\]' $VULN/nuclei.txt"
     [ "$(count_lines "$VULN/xss_reflected.txt")" -gt 0 ] && echo "  XSS verification: bash $VULN/run_dalfox.sh  (يدوي)"
     [ "$JS_SECRET_UNIQUE" -gt 0 ] && echo "  Review unique secrets: cat $JS/secrets_values.txt"
-    [ "$(count_lines "$VULN/gf_sqli.txt")" -gt 0 ] && echo "  SQLi triage: cat $VULN/gf_sqli.txt | head -30  -> sqlmap"
-    [ "$(count_lines "$VULN/gf_ssrf.txt")" -gt 0 ] && echo "  SSRF triage: cat $VULN/gf_ssrf.txt | head -30"
-    [ "$(count_lines "$VULN/gf_lfi.txt")" -gt 0 ] && echo "  LFI triage: cat $VULN/gf_lfi.txt | head -30"
-    [ "$(count_lines "$VULN/gf_rce.txt")" -gt 0 ] && echo "  RCE triage: cat $VULN/gf_rce.txt | head -30"
+    [ "$(count_lines "$VULN/sqli_priority.txt")" -gt 0 ] && echo "  SQLi — start here (id/sort/filter/search params): cat $VULN/sqli_priority.txt  -> sqlmap"
+    [ "$(count_lines "$VULN/gf_sqli.txt")" -gt 0 ] && echo "  SQLi full list (unranked, larger): cat $VULN/gf_sqli.txt | head -30"
+    [ "$(count_lines "$VULN/ssrf_priority.txt")" -gt 0 ] && echo "  SSRF — start here (url/redirect/callback params): cat $VULN/ssrf_priority.txt"
+    [ "$(count_lines "$VULN/gf_ssrf.txt")" -gt 0 ] && echo "  SSRF full list (unranked, larger): cat $VULN/gf_ssrf.txt | head -30"
+    [ "$(count_lines "$VULN/lfi_priority.txt")" -gt 0 ] && echo "  LFI — start here (file/path/template params): cat $VULN/lfi_priority.txt"
+    [ "$(count_lines "$VULN/gf_lfi.txt")" -gt 0 ] && echo "  LFI full list (unranked, larger): cat $VULN/gf_lfi.txt | head -30"
+    [ "$(count_lines "$VULN/rce_priority.txt")" -gt 0 ] && echo "  RCE — start here (cmd/exec/run params): cat $VULN/rce_priority.txt"
+    [ "$(count_lines "$VULN/gf_rce.txt")" -gt 0 ] && echo "  RCE full list (unranked, larger): cat $VULN/gf_rce.txt | head -30"
     [ "$(count_lines "$VULN/idor_priority.txt")" -gt 0 ] && echo "  IDOR — start here (numeric ID/UUID candidates): cat $VULN/idor_priority.txt"
     [ "$(count_lines "$VULN/gf_idor.txt")" -gt 0 ] && echo "  IDOR full list (unranked, larger): cat $VULN/gf_idor.txt | head -30"
+    [ "$(count_lines "$VULN/auth_priority.txt")" -gt 0 ] && echo "  Auth/access-control — start here (admin/token paths): cat $VULN/auth_priority.txt"
     [ "$(count_lines "$VULN/ffuf_all_found.txt")" -gt 0 ] && echo "  FFUF paths: cat $VULN/ffuf_all_found.txt"
     echo ""
     echo "  State file kept at: $STATE_FILE"
