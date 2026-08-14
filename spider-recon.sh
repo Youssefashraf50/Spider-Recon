@@ -20,8 +20,11 @@
 #  - Output reorganized: every subfolder now has a _raw/ dir for intermediate
 #    tool output (gau, wayback, katana, ffuf json, resolved dnsx, etc). Only
 #    actionable/final files stay in subs/ urls/ vuln/ js/ directly.
-#  - Katana: was unbounded (could run for hours) — now capped via -ct plus an
-#    outer `timeout` backstop (30min normal / 45min deep mode)
+#  - Katana: was unbounded (could run for hours) — now chunked + resumable
+#    (same state-file mechanism as httpx/gxss), and seeds are filtered
+#    (static assets dropped) + prioritized (params/API/auth paths first)
+#    + capped, so total seed count no longer scales with raw gau/wayback dump
+#    size on big targets
 #  - New: vuln/idor_priority.txt — auto-extracted numeric-ID/UUID param
 #    candidates from gf_idor.txt, so you don't have to eyeball hundreds of URLs
 # ============================================================
@@ -750,11 +753,57 @@ collect_urls() {
   local KATANA_DEPTH=2
   [ "$DEEP_PROBE" = true ] && KATANA_DEPTH=3
 
-  # Katana input: live hosts + whatever gau/wayback already found (passive URLs)
-  # so katana also crawls known URLs directly, not just root hosts — this
-  # surfaces JS/endpoints those tools didn't fully render.
-  cat "$SUBS/live.txt" "$URLS_RAW/gau.txt" "$URLS_RAW/wayback.txt" 2>/dev/null \
-    | grep -E "^https?://" | sort -u > "$URLS_RAW/katana_input.txt"
+  # ------------------------------------------------------------------
+  # SEED SELECTION (dedup -> filter -> prioritize -> cap)
+  # Feeding katana raw(live + gau + wayback) doesn't scale: a big target can
+  # return 100k+ gau URLs and 150k+ wayback URLs, so even chunked crawling
+  # turns into thousands of chunks. Static assets (images/fonts/css/maps)
+  # also don't yield new links when crawled, so they're pure waste. Instead:
+  #   1. dedup (sort -u, already happening)
+  #   2. drop static-asset extensions
+  #   3. split into "priority" (parameterized / API / auth-admin paths /
+  #      dynamic extensions) vs "other"
+  #   4. always keep all live root hosts, fill the rest of the seed budget
+  #      with priority URLs first, then top up from "other" if room is left
+  # This bounds total seed count so crawl time scales with attack-surface
+  # relevance, not with how many junk URLs wayback happened to archive.
+  # ------------------------------------------------------------------
+  local STATIC_EXT_REGEX='\.(jpe?g|png|gif|bmp|ico|svg|css|woff2?|ttf|eot|otf|mp4|mp3|avi|mov|webm|zip|rar|gz|tar|7z|map)(\?|$)'
+  local PRIORITY_REGEX='(\?[a-zA-Z0-9_]+=|/api/|/v[0-9]+/|graphql|/admin|/account|/auth|/login|/signup|/register|/dashboard|/internal|/user|/profile|/settings|/config|\.(php|asp|aspx|jsp|json|xml|do|action|cgi)(\?|$))'
+
+  cat "$URLS_RAW/gau.txt" "$URLS_RAW/wayback.txt" 2>/dev/null \
+    | grep -E "^https?://" \
+    | grep -viE "$STATIC_EXT_REGEX" \
+    | sort -u > "$URLS_RAW/katana_candidates.txt"
+
+  local STATIC_DROPPED
+  STATIC_DROPPED=$(( $(cat "$URLS_RAW/gau.txt" "$URLS_RAW/wayback.txt" 2>/dev/null | grep -cE "^https?://") - $(count_lines "$URLS_RAW/katana_candidates.txt") ))
+
+  grep -E  "$PRIORITY_REGEX" "$URLS_RAW/katana_candidates.txt" 2>/dev/null | sort -u > "$URLS_RAW/katana_priority.txt"
+  grep -vE "$PRIORITY_REGEX" "$URLS_RAW/katana_candidates.txt" 2>/dev/null | sort -u > "$URLS_RAW/katana_other.txt"
+
+  local KATANA_MAX_SEEDS=3000
+  [ "$DEEP_PROBE" = true ] && KATANA_MAX_SEEDS=6000
+
+  # Live hosts are always kept in full — they're the crawl roots and there
+  # are normally only a few hundred of them at most.
+  cp "$SUBS/live.txt" "$URLS_RAW/katana_input.txt" 2>/dev/null || : > "$URLS_RAW/katana_input.txt"
+
+  local PRIORITY_COUNT
+  PRIORITY_COUNT=$(count_lines "$URLS_RAW/katana_priority.txt")
+  if [ "$PRIORITY_COUNT" -gt "$KATANA_MAX_SEEDS" ]; then
+    shuf "$URLS_RAW/katana_priority.txt" | head -n "$KATANA_MAX_SEEDS" >> "$URLS_RAW/katana_input.txt"
+    warn "Katana: $PRIORITY_COUNT priority URLs found, capped to $KATANA_MAX_SEEDS random sample -> full list kept at $URLS_RAW/katana_priority.txt"
+  else
+    cat "$URLS_RAW/katana_priority.txt" >> "$URLS_RAW/katana_input.txt"
+    local REMAINING=$(( KATANA_MAX_SEEDS - PRIORITY_COUNT ))
+    if [ "$REMAINING" -gt 0 ] && [ -s "$URLS_RAW/katana_other.txt" ]; then
+      shuf "$URLS_RAW/katana_other.txt" | head -n "$REMAINING" >> "$URLS_RAW/katana_input.txt"
+    fi
+  fi
+  sort -u -o "$URLS_RAW/katana_input.txt" "$URLS_RAW/katana_input.txt"
+
+  ok "Katana seeds: $(count_lines "$URLS_RAW/katana_input.txt") (static assets dropped: $STATIC_DROPPED, priority matches: $PRIORITY_COUNT, cap: $KATANA_MAX_SEEDS)"
 
   # Chunked instead of one flat run. Before: one katana call against the whole
   # seed list with no ceiling -> could run 7+ hours on a big target with no
@@ -787,7 +836,7 @@ collect_urls() {
   }
 
   if [ -s "$URLS_RAW/katana_input.txt" ]; then
-    log "  -> Katana: $(count_lines "$URLS_RAW/katana_input.txt") seed URLs in chunks of $KATANA_CHUNK_SIZE (~${KATANA_CHUNK_MINUTES}m/chunk, resumable)"
+    log "  -> Crawling in chunks of $KATANA_CHUNK_SIZE (~${KATANA_CHUNK_MINUTES}m/chunk, resumable)"
     run_chunked_scan "katana" "$URLS_RAW/katana_input.txt" "$KATANA_CHUNK_SIZE" "$URLS_RAW/katana.txt" katana_chunk_cmd
     sort -u -o "$URLS_RAW/katana.txt" "$URLS_RAW/katana.txt" 2>/dev/null
     ok "Katana URLs (depth $KATANA_DEPTH): $(count_lines "$URLS_RAW/katana.txt")"
