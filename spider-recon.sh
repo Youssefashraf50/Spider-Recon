@@ -15,6 +15,15 @@
 #  - Port scanning (naabu) REMOVED — low value for bug bounty recon and
 #    triggers WAF/IP bans too easily
 #  - Katana now also crawls passive URL sources (gau/wayback), not just live hosts
+# ------------------------------------------------------------
+#  v3.1 changes:
+#  - Output reorganized: every subfolder now has a _raw/ dir for intermediate
+#    tool output (gau, wayback, katana, ffuf json, resolved dnsx, etc). Only
+#    actionable/final files stay in subs/ urls/ vuln/ js/ directly.
+#  - Katana: was unbounded (could run for hours) — now capped via -ct plus an
+#    outer `timeout` backstop (30min normal / 45min deep mode)
+#  - New: vuln/idor_priority.txt — auto-extracted numeric-ID/UUID param
+#    candidates from gf_idor.txt, so you don't have to eyeball hundreds of URLs
 # ============================================================
 
 set -o pipefail
@@ -204,7 +213,7 @@ init_state() {
   fi
 
   if [ ! -f "$STATE_FILE" ]; then
-    jq -n --argjson ver "$CHECKPOINT_VERSION" --arg sv "3.0" --arg d "$DOMAIN" --arg t "$(date -Iseconds)" \
+    jq -n --argjson ver "$CHECKPOINT_VERSION" --arg sv "3.1" --arg d "$DOMAIN" --arg t "$(date -Iseconds)" \
       '{checkpoint_version:$ver, script_version:$sv, domain:$d, completed_phases:[], progress:{}, started_at:$t, updated_at:$t}' \
       > "$STATE_FILE"
     return
@@ -215,7 +224,7 @@ init_state() {
   if [ "$ver" != "$CHECKPOINT_VERSION" ]; then
     warn "State file format is old/incompatible (v$ver) — starting fresh (old file kept as .bak)."
     cp "$STATE_FILE" "${STATE_FILE}.v${ver}.bak" 2>/dev/null
-    jq -n --argjson ver "$CHECKPOINT_VERSION" --arg sv "3.0" --arg d "$DOMAIN" --arg t "$(date -Iseconds)" \
+    jq -n --argjson ver "$CHECKPOINT_VERSION" --arg sv "3.1" --arg d "$DOMAIN" --arg t "$(date -Iseconds)" \
       '{checkpoint_version:$ver, script_version:$sv, domain:$d, completed_phases:[], progress:{}, started_at:$t, updated_at:$t}' \
       > "$STATE_FILE"
   else
@@ -268,7 +277,7 @@ is_phase_done() {
     gf)         [ -f "$VULN/gf_sqli.txt" ] ;;
     nuclei)     [ -f "$VULN/nuclei.txt" ] ;;
     ffuf)       [ -f "$VULN/ffuf_all_found.txt" ] && [ ! -f "$VULN/.in_progress" ] ;;
-    xss)        [ -f "$VULN/xss_dedup.txt" ] ;;
+    xss)        [ -f "$VULN_RAW/xss_dedup.txt" ] ;;
     *) return 1 ;;
   esac
 }
@@ -532,7 +541,7 @@ cat << "EOF"
   \___ \| '_ \| |/ _` |/ _ \ '__|  |  _  // _ \/ __/ _ \| '_ \
   ____) | |_) | | (_| |  __/ |     | | \ \  __/ (_| (_) | | | |
  |_____/| .__/|_|\__,_|\___|_|     |_|  \_\___|\___\___/|_| |_|
-        | |              v3.0  -  Bug Bounty Edition
+        | |              v3.1  -  Bug Bounty Edition
         |_|              By: Youssef Ashraf
 EOF
   echo ""
@@ -551,7 +560,14 @@ setup_dirs() {
   URLS="$OUT/urls"
   VULN="$OUT/vuln"
   JS="$OUT/js"
-  mkdir -p "$SUBS" "$URLS" "$VULN" "$JS"
+  # _raw = intermediate/tool-output files (debugging only, not meant to be
+  # read manually). Everything actionable stays directly in SUBS/URLS/VULN/JS
+  # so those folders don't get cluttered with 15+ files of mixed importance.
+  SUBS_RAW="$SUBS/_raw"
+  URLS_RAW="$URLS/_raw"
+  VULN_RAW="$VULN/_raw"
+  JS_RAW="$JS/_raw"
+  mkdir -p "$SUBS" "$URLS" "$VULN" "$JS" "$SUBS_RAW" "$URLS_RAW" "$VULN_RAW" "$JS_RAW"
 
   init_state
   acquire_lock
@@ -569,19 +585,19 @@ enum_subdomains() {
   log "  -> Launching subfinder + sublist3r in parallel..."
 
   ( timeout 180 subfinder -d "$DOMAIN" -all -silent \
-      -o "$SUBS/subfinder.txt" 2>/dev/null \
-      || { warn "subfinder timed out"; touch "$SUBS/subfinder.txt"; } ) &
+      -o "$SUBS_RAW/subfinder.txt" 2>/dev/null \
+      || { warn "subfinder timed out"; touch "$SUBS_RAW/subfinder.txt"; } ) &
   local PID_SUB=$!
 
   (
-    touch "$SUBS/sublist3r.txt"
+    touch "$SUBS_RAW/sublist3r.txt"
     if command -v sublist3r &>/dev/null; then
-      timeout 180 sublist3r -d "$DOMAIN" -o "$SUBS/sublist3r.txt" &>/dev/null \
+      timeout 180 sublist3r -d "$DOMAIN" -o "$SUBS_RAW/sublist3r.txt" &>/dev/null \
         || warn "sublist3r timed out"
     else
       local SUB3_SCRIPT="$HOME/.local/share/Sublist3r/sublist3r.py"
       if [ -f "$SUB3_SCRIPT" ]; then
-        timeout 180 python3 "$SUB3_SCRIPT" -d "$DOMAIN" -o "$SUBS/sublist3r.txt" &>/dev/null \
+        timeout 180 python3 "$SUB3_SCRIPT" -d "$DOMAIN" -o "$SUBS_RAW/sublist3r.txt" &>/dev/null \
           || warn "sublist3r timed out"
       else
         warn "sublist3r not installed — skipping"
@@ -592,21 +608,21 @@ enum_subdomains() {
 
   wait "$PID_SUB" "$PID_SUB3" 2>/dev/null
 
-  ok "subfinder: $(count_lines "$SUBS/subfinder.txt")  sublist3r: $(count_lines "$SUBS/sublist3r.txt")"
+  ok "subfinder: $(count_lines "$SUBS_RAW/subfinder.txt")  sublist3r: $(count_lines "$SUBS_RAW/sublist3r.txt")"
 
-  cat "$SUBS"/*.txt 2>/dev/null \
+  cat "$SUBS_RAW"/*.txt 2>/dev/null \
     | grep -E "(^|\.)${DOMAIN}$" \
     | sed 's/^\*\.//' \
-    | sort -u > "$SUBS/all_raw.txt"
+    | sort -u > "$SUBS_RAW/all_raw.txt"
 
   if [ -n "$SCOPE_FILE" ] && [ -f "$SCOPE_FILE" ]; then
     while IFS= read -r sub; do
       in_scope "$sub" >> "$SUBS/all.txt"
-    done < "$SUBS/all_raw.txt"
+    done < "$SUBS_RAW/all_raw.txt"
     sort -u -o "$SUBS/all.txt" "$SUBS/all.txt"
-    ok "Scope filtered: $(count_lines "$SUBS/all.txt") / $(count_lines "$SUBS/all_raw.txt") subdomains"
+    ok "Scope filtered: $(count_lines "$SUBS/all.txt") / $(count_lines "$SUBS_RAW/all_raw.txt") subdomains"
   else
-    cp "$SUBS/all_raw.txt" "$SUBS/all.txt"
+    cp "$SUBS_RAW/all_raw.txt" "$SUBS/all.txt"
   fi
 
   ok "Total unique subdomains: $(count_lines "$SUBS/all.txt")"
@@ -619,12 +635,12 @@ enum_subdomains() {
       -t "$THREADS" \
       -retry 2 \
       -resp \
-      -o "$SUBS/resolved.txt" 2>/dev/null \
-      || cp "$SUBS/all.txt" "$SUBS/resolved.txt"
-    awk '{print $1}' "$SUBS/resolved.txt" | sort -u > "$SUBS/resolved_hosts.txt"
+      -o "$SUBS_RAW/resolved.txt" 2>/dev/null \
+      || cp "$SUBS/all.txt" "$SUBS_RAW/resolved.txt"
+    awk '{print $1}' "$SUBS_RAW/resolved.txt" | sort -u > "$SUBS/resolved_hosts.txt"
   else
     warn "No subdomains to resolve"
-    touch "$SUBS/resolved.txt" "$SUBS/resolved_hosts.txt"
+    touch "$SUBS_RAW/resolved.txt" "$SUBS/resolved_hosts.txt"
   fi
 
   ok "Resolved: $(count_lines "$SUBS/resolved_hosts.txt") hosts"
@@ -668,7 +684,7 @@ probe_hosts() {
       -tech-detect \
       -cdn \
       -follow-redirects \
-      2>>"$SUBS/httpx_errors.txt" >> "$out_file"
+      2>>"$SUBS_RAW/httpx_errors.txt" >> "$out_file"
   }
 
   run_chunked_scan "httpx" "$SUBS/resolved_hosts.txt" 30 "$SUBS/live_detailed.txt" httpx_chunk_cmd
@@ -696,7 +712,7 @@ probe_hosts() {
 
   if [ "$LIVE_COUNT" -eq 0 ]; then
     warn "Zero live hosts detected!"
-    warn "  Check: $SUBS/httpx_errors.txt"
+    warn "  Check: $SUBS_RAW/httpx_errors.txt"
     warn "  Check: $SUBS/resolved_hosts.txt ($(count_lines "$SUBS/resolved_hosts.txt") entries)"
     warn "  Manual test: httpx -u $DOMAIN -title -status-code"
   fi
@@ -714,17 +730,17 @@ collect_urls() {
   if [ -s "$SUBS/live.txt" ]; then
     cat "$SUBS/live.txt" \
       | timeout 180 gau --threads "$THREADS" --subs 2>/dev/null \
-      | anew "$URLS/gau.txt" >/dev/null || true
-    ok "GAU URLs: $(count_lines "$URLS/gau.txt")"
+      | anew "$URLS_RAW/gau.txt" >/dev/null || true
+    ok "GAU URLs: $(count_lines "$URLS_RAW/gau.txt")"
   else
-    touch "$URLS/gau.txt"
+    touch "$URLS_RAW/gau.txt"
     warn "No live hosts for GAU"
   fi
 
   cat "$SUBS/resolved_hosts.txt" \
     | timeout 120 waybackurls 2>/dev/null \
-    | anew "$URLS/wayback.txt" >/dev/null || true
-  ok "Wayback URLs: $(count_lines "$URLS/wayback.txt")"
+    | anew "$URLS_RAW/wayback.txt" >/dev/null || true
+  ok "Wayback URLs: $(count_lines "$URLS_RAW/wayback.txt")"
 
   phase_end "3"
 
@@ -737,37 +753,64 @@ collect_urls() {
   # Katana input: live hosts + whatever gau/wayback already found (passive URLs)
   # so katana also crawls known URLs directly, not just root hosts — this
   # surfaces JS/endpoints those tools didn't fully render.
-  cat "$SUBS/live.txt" "$URLS/gau.txt" "$URLS/wayback.txt" 2>/dev/null \
-    | grep -E "^https?://" | sort -u > "$URLS/katana_input.txt"
+  cat "$SUBS/live.txt" "$URLS_RAW/gau.txt" "$URLS_RAW/wayback.txt" 2>/dev/null \
+    | grep -E "^https?://" | sort -u > "$URLS_RAW/katana_input.txt"
 
-  if [ -s "$URLS/katana_input.txt" ]; then
-    katana \
-      -list "$URLS/katana_input.txt" \
+  # Chunked instead of one flat run. Before: one katana call against the whole
+  # seed list with no ceiling -> could run 7+ hours on a big target with no
+  # way to stop/resume partway. Now: seed list is split into small chunks,
+  # each chunk gets a short per-chunk time budget, and progress is saved after
+  # every chunk via the same state-file mechanism used for httpx/gxss. If you
+  # Ctrl+C or the run gets killed, re-running the same command resumes from
+  # the next unfinished chunk instead of losing everything or being capped at
+  # a fixed total. No need to guess target size up front.
+  local KATANA_CHUNK_SIZE=25
+  local KATANA_CHUNK_MINUTES=5
+  if $SLOW; then
+    KATANA_CHUNK_SIZE=15
+    KATANA_CHUNK_MINUTES=3
+  fi
+
+  katana_chunk_cmd() {
+    local chunk_file="$1" out_file="$2"
+    timeout "$(( (KATANA_CHUNK_MINUTES + 1) * 60 ))" katana \
+      -list "$chunk_file" \
       -d "$KATANA_DEPTH" \
       -jc \
       -kf all \
       -c "$THREADS" \
       -rl "$RATE_LIMIT" \
       -timeout 10 \
+      -ct "$KATANA_CHUNK_MINUTES" \
       -silent \
-      -o "$URLS/katana.txt" 2>/dev/null || true
-    ok "Katana URLs (depth $KATANA_DEPTH, $(count_lines "$URLS/katana_input.txt") seed URLs): $(count_lines "$URLS/katana.txt")"
+      2>/dev/null >> "$out_file" || true
+  }
+
+  if [ -s "$URLS_RAW/katana_input.txt" ]; then
+    log "  -> Katana: $(count_lines "$URLS_RAW/katana_input.txt") seed URLs in chunks of $KATANA_CHUNK_SIZE (~${KATANA_CHUNK_MINUTES}m/chunk, resumable)"
+    run_chunked_scan "katana" "$URLS_RAW/katana_input.txt" "$KATANA_CHUNK_SIZE" "$URLS_RAW/katana.txt" katana_chunk_cmd
+    sort -u -o "$URLS_RAW/katana.txt" "$URLS_RAW/katana.txt" 2>/dev/null
+    ok "Katana URLs (depth $KATANA_DEPTH): $(count_lines "$URLS_RAW/katana.txt")"
 
     if [ "$RUN_GOSPIDER" = true ] && command -v gospider &>/dev/null; then
       log "  -> gospider (extra coverage, -g enabled)..."
-      gospider \
-        -S "$SUBS/live.txt" \
-        -c 10 -d 2 \
-        -t "$THREADS" \
-        --js -q 2>/dev/null \
-        | grep -oE 'https?://[^ ]+' \
-        | anew "$URLS/gospider.txt" >/dev/null || true
-      ok "GoSpider URLs: $(count_lines "$URLS/gospider.txt")"
+      gospider_chunk_cmd() {
+        local chunk_file="$1" out_file="$2"
+        timeout "$(( (KATANA_CHUNK_MINUTES + 1) * 60 ))" gospider \
+          -S "$chunk_file" \
+          -c 10 -d 2 \
+          -t "$THREADS" \
+          --js -q 2>/dev/null \
+          | grep -oE 'https?://[^ ]+' >> "$out_file" || true
+      }
+      run_chunked_scan "gospider" "$SUBS/live.txt" "$KATANA_CHUNK_SIZE" "$URLS_RAW/gospider.txt" gospider_chunk_cmd
+      sort -u -o "$URLS_RAW/gospider.txt" "$URLS_RAW/gospider.txt" 2>/dev/null
+      ok "GoSpider URLs: $(count_lines "$URLS_RAW/gospider.txt")"
     else
-      touch "$URLS/gospider.txt"
+      touch "$URLS_RAW/gospider.txt"
     fi
   else
-    touch "$URLS/katana.txt" "$URLS/gospider.txt"
+    touch "$URLS_RAW/katana.txt" "$URLS_RAW/gospider.txt"
     warn "No live hosts to crawl — skipping katana/gospider."
   fi
 
@@ -783,18 +826,18 @@ collect_urls() {
       [ -f "$f" ] && PARAM_RESULT="$f" && break
     done
     if [ -n "$PARAM_RESULT" ]; then
-      mv "$PARAM_RESULT" "$URLS/params.txt"
+      mv "$PARAM_RESULT" "$URLS_RAW/params.txt"
       rm -rf results/ output/ 2>/dev/null
-      ok "ParamSpider URLs: $(count_lines "$URLS/params.txt")"
+      ok "ParamSpider URLs: $(count_lines "$URLS_RAW/params.txt")"
     else
-      touch "$URLS/params.txt"
+      touch "$URLS_RAW/params.txt"
     fi
   else
-    touch "$URLS/params.txt"
+    touch "$URLS_RAW/params.txt"
     warn "paramspider not found"
   fi
 
-  cat "$URLS"/*.txt 2>/dev/null \
+  cat "$URLS_RAW"/*.txt 2>/dev/null \
     | grep -E "^https?://" \
     | sort -u > "$URLS/all_urls.txt"
   ok "Total unique URLs: $(count_lines "$URLS/all_urls.txt")"
@@ -834,7 +877,7 @@ analyze_js() {
 
     if [ "$START_INDEX" -eq 0 ]; then
       : > "$JS/endpoints.txt"
-      : > "$JS/secrets.txt"
+      : > "$JS_RAW/secrets.txt"
     else
       log "  -> Resuming JS analysis from item $START_INDEX/$TOTAL_JS"
     fi
@@ -861,7 +904,7 @@ analyze_js() {
         echo "$body" \
           | grep -ioE "$SECRET_PATTERN" \
           | sed "s|^|[JS] $jsurl  ->  |" \
-          >> "$JS/secrets.txt"
+          >> "$JS_RAW/secrets.txt"
       fi
     }
     export -f fetch_js_one 2>/dev/null
@@ -885,17 +928,18 @@ analyze_js() {
     echo ""
     state_set '.progress.js.last_index' "$count"
 
-    [ -f "$JS/endpoints.txt" ] && sort -u -o "$JS/endpoints.txt" "$JS/endpoints.txt"
-    [ -f "$JS/secrets.txt"   ] && sort -u -o "$JS/secrets.txt" "$JS/secrets.txt"
+    [ -f "$JS/endpoints.txt" ]   && sort -u -o "$JS/endpoints.txt" "$JS/endpoints.txt"
+    [ -f "$JS_RAW/secrets.txt" ] && sort -u -o "$JS_RAW/secrets.txt" "$JS_RAW/secrets.txt"
 
     # === VALUE-LEVEL DEDUP FOR SECRETS ===
     # secrets.txt has lines like:   [JS] https://x.com/b.js  ->  API_KEY=abc123
     # Line-level sort -u doesn't dedup the actual value across URLs.
-    # Extract just the value portion, dedup that.
-    if [ -s "$JS/secrets.txt" ]; then
-      grep -oP '->\s*\K.*' "$JS/secrets.txt" | sed 's/^ *//' | sort -u > "$JS/secrets_values.txt"
+    # Extract just the value portion, dedup that. secrets_values.txt is the
+    # only one of the two you actually need to open.
+    if [ -s "$JS_RAW/secrets.txt" ]; then
+      grep -oP '->\s*\K.*' "$JS_RAW/secrets.txt" | sed 's/^ *//' | sort -u > "$JS/secrets_values.txt"
       local RAW_COUNT UNIQUE_COUNT
-      RAW_COUNT=$(count_lines "$JS/secrets.txt")
+      RAW_COUNT=$(count_lines "$JS_RAW/secrets.txt")
       UNIQUE_COUNT=$(count_lines "$JS/secrets_values.txt")
       ok "JS secrets — raw matches: $RAW_COUNT, unique values: $UNIQUE_COUNT"
       if [ "$UNIQUE_COUNT" -gt 0 ]; then
@@ -921,14 +965,14 @@ filter_urls() {
     | sort -u > "$URLS/filtered.txt" || touch "$URLS/filtered.txt"
 
   grep -E "\?[a-zA-Z0-9_]+=." "$URLS/all_urls.txt" 2>/dev/null \
-    | sort -u > "$URLS/has_params.txt" || touch "$URLS/has_params.txt"
+    | sort -u > "$URLS_RAW/has_params.txt" || touch "$URLS_RAW/has_params.txt"
 
   if command -v qsreplace &>/dev/null; then
-    cat "$URLS/has_params.txt" \
+    cat "$URLS_RAW/has_params.txt" \
       | qsreplace -a 2>/dev/null \
       | sort -u > "$URLS/params_urls.txt" || touch "$URLS/params_urls.txt"
   else
-    cp "$URLS/has_params.txt" "$URLS/params_urls.txt"
+    cp "$URLS_RAW/has_params.txt" "$URLS/params_urls.txt"
   fi
 
   ok "Filtered (ext): $(count_lines "$URLS/filtered.txt") | Parameterized: $(count_lines "$URLS/params_urls.txt")"
@@ -983,6 +1027,26 @@ gf_patterns() {
     warn "  Manual: cat $URLS/all_urls.txt | grep '=' | head -5"
   fi
 
+  # === IDOR PRIORITY CANDIDATES ===
+  # gf_idor.txt is unranked — every param-bearing URL gf's regex thinks looks
+  # ID-like ends up in one flat list. In practice the URLs worth testing by
+  # hand are the ones with a plain numeric ID or a UUID in the value, since
+  # those are what you'd actually swap to test authorization. This pulls
+  # those out into a short list instead of a wall of hundreds of URLs.
+  : > "$VULN/idor_priority.txt"
+  if [ -s "$VULN/gf_idor.txt" ]; then
+    grep -E '[?&][A-Za-z_]*(id|uid|user|account|order|file|project|invoice|doc)[A-Za-z_]*=[0-9]+([&#]|$)' \
+      "$VULN/gf_idor.txt" 2>/dev/null | sort -u >> "$VULN/idor_priority.txt"
+    grep -Eio '[?&][A-Za-z_]+=[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' \
+      "$VULN/gf_idor.txt" 2>/dev/null | sort -u >> "$VULN/idor_priority.txt"
+    sort -u -o "$VULN/idor_priority.txt" "$VULN/idor_priority.txt"
+  fi
+  local IDOR_PRIORITY_COUNT
+  IDOR_PRIORITY_COUNT=$(count_lines "$VULN/idor_priority.txt")
+  if [ "$IDOR_PRIORITY_COUNT" -gt 0 ]; then
+    ok "IDOR priority candidates (numeric ID / UUID params): $IDOR_PRIORITY_COUNT -> $VULN/idor_priority.txt"
+  fi
+
   phase_end "8"
 }
 
@@ -1032,7 +1096,7 @@ run_nuclei() {
     -retries 1 \
     -silent \
     -o "$VULN/nuclei.txt" \
-    2>"$VULN/nuclei_errors.txt" || true
+    2>"$VULN_RAW/nuclei_errors.txt" || true
 
   local N_COUNT
   N_COUNT=$(count_lines "$VULN/nuclei.txt")
@@ -1048,7 +1112,7 @@ run_nuclei() {
   if [ "$N_COUNT" -eq 0 ]; then
     warn "Nuclei = 0. Debug:"
     warn "  nuclei -u \$(head -1 $SUBS/live.txt) -severity info -debug 2>&1 | head -30"
-    warn "  Check errors: cat $VULN/nuclei_errors.txt | head -20"
+    warn "  Check errors: cat $VULN_RAW/nuclei_errors.txt | head -20"
   fi
 
   phase_end "9"
@@ -1138,12 +1202,12 @@ run_ffuf() {
         -ac \
         -p 0.1 \
         -of json \
-        -o "$VULN/ffuf_${safe}.json" \
+        -o "$VULN_RAW/ffuf_${safe}.json" \
         -s \
         2>/dev/null
 
       # Filter out baseline-matching responses from the JSON
-      if [ -f "$VULN/ffuf_${safe}.json" ] && [ "${BASELINE_CODE}" != "" ]; then
+      if [ -f "$VULN_RAW/ffuf_${safe}.json" ] && [ "${BASELINE_CODE}" != "" ]; then
         local FILTERED
         FILTERED=$(mktemp)
         jq --argjson bc "${BASELINE_CODE:-0}" --argjson bs "${BASELINE_SIZE:-0}" --argjson bw "${BASELINE_WORDS:-0}" '
@@ -1151,7 +1215,7 @@ run_ffuf() {
             .status != $bc or
             (.length != $bs and .words != $bw)
           ))
-        ' "$VULN/ffuf_${safe}.json" > "$FILTERED" 2>/dev/null && mv "$FILTERED" "$VULN/ffuf_${safe}.json"
+        ' "$VULN_RAW/ffuf_${safe}.json" > "$FILTERED" 2>/dev/null && mv "$FILTERED" "$VULN_RAW/ffuf_${safe}.json"
         rm -f "$FILTERED"
       fi
     ) &
@@ -1168,12 +1232,12 @@ run_ffuf() {
   rm -f "$VULN/.in_progress"
 
   local FFUF_FILES
-  FFUF_FILES=$(ls "$VULN"/ffuf_*.json 2>/dev/null | wc -l)
-  ok "FFUF done — $FFUF_FILES result files in $VULN/"
+  FFUF_FILES=$(ls "$VULN_RAW"/ffuf_*.json 2>/dev/null | wc -l)
+  ok "FFUF done — $FFUF_FILES result files in $VULN_RAW/"
 
   : > "$VULN/ffuf_all_found.txt"
   if [ "$FFUF_FILES" -gt 0 ]; then
-    for f in "$VULN"/ffuf_*.json; do
+    for f in "$VULN_RAW"/ffuf_*.json; do
       grep -oP '"url"\s*:\s*"\K[^"]+' "$f" 2>/dev/null
     done | sort -u > "$VULN/ffuf_all_found.txt"
     ok "FFUF unique paths found (baseline-filtered): $(count_lines "$VULN/ffuf_all_found.txt")"
@@ -1203,22 +1267,22 @@ run_xss() {
   fi
 
   if command -v uro &>/dev/null; then
-    cat "$SRC" | uro 2>/dev/null | sort -u > "$VULN/xss_dedup.txt"
+    cat "$SRC" | uro 2>/dev/null | sort -u > "$VULN_RAW/xss_dedup.txt"
   else
-    cat "$SRC" | sort -u > "$VULN/xss_dedup.txt"
+    cat "$SRC" | sort -u > "$VULN_RAW/xss_dedup.txt"
   fi
-  ok "After dedup: $(count_lines "$VULN/xss_dedup.txt") URLs"
+  ok "After dedup: $(count_lines "$VULN_RAW/xss_dedup.txt") URLs"
 
   local GXSS_SKIP_THRESHOLD=5000
 
-  if command -v Gxss &>/dev/null && [ -s "$VULN/xss_dedup.txt" ]; then
+  if command -v Gxss &>/dev/null && [ -s "$VULN_RAW/xss_dedup.txt" ]; then
     local XSS_TOTAL
-    XSS_TOTAL=$(count_lines "$VULN/xss_dedup.txt")
+    XSS_TOTAL=$(count_lines "$VULN_RAW/xss_dedup.txt")
 
     if [ "$XSS_TOTAL" -gt "$GXSS_SKIP_THRESHOLD" ]; then
       warn "Gxss skipped: $XSS_TOTAL URLs > $GXSS_SKIP_THRESHOLD (Gxss is slow/unmaintained at this scale)."
       warn "  dalfox will do its own reflection check instead"
-      cp "$VULN/xss_dedup.txt" "$VULN/xss_reflected.txt"
+      cp "$VULN_RAW/xss_dedup.txt" "$VULN/xss_reflected.txt"
       touch "$VULN/.gxss_skipped"
     else
       log "  -> Running Gxss (reflection check) in batches..."
@@ -1236,7 +1300,7 @@ run_xss() {
 
       local tmp_dir
       tmp_dir=$(mktemp -d)
-      split -l "$GXSS_BATCH" "$VULN/xss_dedup.txt" "$tmp_dir/gxss_chunk_"
+      split -l "$GXSS_BATCH" "$VULN_RAW/xss_dedup.txt" "$tmp_dir/gxss_chunk_"
 
       local chunk_num=0
       for chunk_file in "$tmp_dir"/gxss_chunk_*; do
@@ -1255,11 +1319,11 @@ run_xss() {
     fi
     ok "Gxss reflected URLs: $(count_lines "$VULN/xss_reflected.txt")"
   else
-    cp "$VULN/xss_dedup.txt" "$VULN/xss_reflected.txt" 2>/dev/null || true
+    cp "$VULN_RAW/xss_dedup.txt" "$VULN/xss_reflected.txt" 2>/dev/null || true
   fi
 
   local DALFOX_SRC="$VULN/xss_reflected.txt"
-  [ ! -s "$DALFOX_SRC" ] && DALFOX_SRC="$VULN/xss_dedup.txt"
+  [ ! -s "$DALFOX_SRC" ] && DALFOX_SRC="$VULN_RAW/xss_dedup.txt"
 
   cat > "$VULN/run_dalfox.sh" <<DALFOX_CMD
 #!/bin/bash
@@ -1316,13 +1380,13 @@ report() {
   local JS_SECRET_UNIQUE=0
   if [ -f "$JS/secrets_values.txt" ]; then
     JS_SECRET_UNIQUE=$(count_lines "$JS/secrets_values.txt")
-  elif [ -f "$JS/secrets.txt" ]; then
-    JS_SECRET_UNIQUE=$(count_lines "$JS/secrets.txt")
+  elif [ -f "$JS_RAW/secrets.txt" ]; then
+    JS_SECRET_UNIQUE=$(count_lines "$JS_RAW/secrets.txt")
   fi
 
   {
     echo "================================================"
-    echo "       SPIDER-RECON v3.0 — FINAL REPORT"
+    echo "       SPIDER-RECON v3.1 — FINAL REPORT"
     echo "================================================"
     echo "Target   : $DOMAIN"
     echo "Date     : $(date)"
@@ -1360,6 +1424,7 @@ report() {
     printf "  %-30s : %s\n" "LFI (gf pattern)"        "$(count_lines "$VULN/gf_lfi.txt")"
     printf "  %-30s : %s\n" "RCE (gf pattern)"        "$(count_lines "$VULN/gf_rce.txt")"
     printf "  %-30s : %s\n" "IDOR (gf pattern)"       "$(count_lines "$VULN/gf_idor.txt")"
+    printf "  %-30s : %s\n" "  -> priority (numeric ID/UUID)" "$(count_lines "$VULN/idor_priority.txt")"
     printf "  %-30s : %s\n" "Open Redirect (gf)"      "$(count_lines "$VULN/gf_redirect.txt")"
     printf "  %-30s : %s\n" "SSTI (gf pattern)"       "$(count_lines "$VULN/gf_ssti.txt")"
     echo ""
@@ -1381,11 +1446,16 @@ report() {
     [ "$(count_lines "$VULN/gf_ssrf.txt")" -gt 0 ] && echo "  SSRF triage: cat $VULN/gf_ssrf.txt | head -30"
     [ "$(count_lines "$VULN/gf_lfi.txt")" -gt 0 ] && echo "  LFI triage: cat $VULN/gf_lfi.txt | head -30"
     [ "$(count_lines "$VULN/gf_rce.txt")" -gt 0 ] && echo "  RCE triage: cat $VULN/gf_rce.txt | head -30"
-    [ "$(count_lines "$VULN/gf_idor.txt")" -gt 0 ] && echo "  IDOR triage: cat $VULN/gf_idor.txt | head -30"
+    [ "$(count_lines "$VULN/idor_priority.txt")" -gt 0 ] && echo "  IDOR — start here (numeric ID/UUID candidates): cat $VULN/idor_priority.txt"
+    [ "$(count_lines "$VULN/gf_idor.txt")" -gt 0 ] && echo "  IDOR full list (unranked, larger): cat $VULN/gf_idor.txt | head -30"
     [ "$(count_lines "$VULN/ffuf_all_found.txt")" -gt 0 ] && echo "  FFUF paths: cat $VULN/ffuf_all_found.txt"
     echo ""
     echo "  State file kept at: $STATE_FILE"
     echo "  (Delete it manually to force a full fresh scan next run)"
+    echo ""
+    echo "  Note: every subfolder (subs/, urls/, vuln/, js/) has a _raw/ dir"
+    echo "  with intermediate tool output (gau, wayback, katana, ffuf json, etc)."
+    echo "  You don't need to open those — everything actionable is one level up."
     echo "================================================"
   } | tee "$REPORT"
 
@@ -1430,7 +1500,7 @@ main() {
   report
   # State file intentionally kept — delete manually for full fresh scan
   release_lock
-  echo -e "\n${GREEN}${BOLD}[✔] Spider-Recon v3.0 done! Output: $OUT${NC}"
+  echo -e "\n${GREEN}${BOLD}[✔] Spider-Recon v3.1 done! Output: $OUT${NC}"
   echo -e "${CYAN}State file: $STATE_FILE (kept for resume; delete to force clean start)${NC}"
 }
 
